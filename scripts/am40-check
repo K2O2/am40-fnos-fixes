@@ -1,0 +1,224 @@
+#!/bin/bash
+# AM40 开机自检 / 系统更新后自检
+# 用法: sudo am40-check            (装到 /usr/local/sbin 后直接跑)
+#       sudo bash am40-check.sh    (从任意位置跑)
+# 只读检查，不修改任何东西。
+CHAIN_MD5="53e488ce68d573274c35730385bd2d01"   # AM40 启动链 0x8000..0x1000000
+DTB_MPP_MD5="1eecee2862120de4bf4bb63ce83fc32c" # rk3399-smart-am40-mpp.dtb
+DTB_FULL_MD5="a916a5220aa85c7b3a7bd300ae63c813" # rk3399-smart-am40-mpp-full.dtb (满编 MPP)
+DTB_RGA_MD5="21d879e3618f6f49498d629139a6d0c3"  # rk3399-smart-am40-mpp-rga.dtb (满编 MPP + RGA 修正)
+MPP_KO=/lib/modules/$(uname -r)/updates/trim/rk_vcodec/rk_vcodec.ko
+ok=0; bad=0
+OK()  { printf '  [ OK ] %s\n' "$*"; ok=$((ok+1)); }
+BAD() { printf '  [FAIL] %s\n' "$*"; bad=$((bad+1)); }
+WARN(){ printf '  [WARN] %s\n' "$*"; }
+SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo"
+
+echo "=================== AM40 自检 $(date '+%F %T') ==================="
+echo "--- 板子 / 内核 ---"
+echo "  model : $(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+echo "  kernel: $(uname -r)   ($(uname -v | cut -d' ' -f1-3))"
+echo "  cmdline root: $(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline)"
+echo "  cmdline ubootpart: $(sed -n 's/.*ubootpart=\([^ ]*\).*/\1/p' /proc/cmdline)"
+
+echo "--- 从哪块盘启动 ---"
+ROOTDEV=$(findmnt -no SOURCE /)
+if [ "$ROOTDEV" = "/dev/mmcblk1p2" ]; then
+  echo "  系统盘: SD 卡 (mmcblk1)   <-- 卡启模式"
+elif [ "$ROOTDEV" = "/dev/mmcblk0p2" ]; then
+  echo "  系统盘: 板载 eMMC (mmcblk0)   <-- eMMC 模式"
+else
+  echo "  系统盘: $ROOTDEV"
+fi
+echo "  root PARTUUID: $(findmnt -no PARTUUID /)"
+echo "  /boot 所在:    $(findmnt -no SOURCE /boot)  PARTUUID=$(findmnt -no PARTUUID /boot)"
+
+echo "--- 启动链 (0x8000..0x1000000) ---"
+BOOTDEVP=$(lsblk -no PKNAME "$(findmnt -no SOURCE /boot)" 2>/dev/null | head -1)
+BOOTDEV="/dev/$BOOTDEVP"
+if [ -b "$BOOTDEV" ]; then
+  GOT=$($SUDO dd if="$BOOTDEV" bs=512 skip=64 count=32704 status=none 2>/dev/null | md5sum | cut -d' ' -f1)
+  if [ "$GOT" = "$CHAIN_MD5" ]; then
+    OK "$BOOTDEV 启动链完好，本盘可独立启动 (md5 $GOT)"
+  elif [ "$GOT" = "$(printf '0%.0s' $(seq 128))" ]; then
+    BAD "$BOOTDEV 启动链被清空(全 0)！该盘不能独立启动 —— 立刻从好盘/镜像恢复"
+  else
+    BAD "$BOOTDEV 启动链 md5 不是 AM40 的 ($GOT != $CHAIN_MD5)"
+  fi
+else
+  WARN "找不到启动盘设备 ($BOOTDEV)，跳过启动链检查"
+fi
+# 另一块盘（eMMC）的启动区现状
+if [ -b /dev/mmcblk0 ] && [ "$BOOTDEV" != "/dev/mmcblk0" ]; then
+  NZ=$($SUDO dd if=/dev/mmcblk0 bs=1024 skip=32 count=992 status=none 2>/dev/null | tr -d '\0' | wc -c)
+  if [ "$NZ" = 0 ]; then
+    echo "  备注: eMMC 的启动区(0x8000~0x100000)是空的 —— 正常，它现在只当数据盘"
+  else
+    echo "  备注: eMMC 启动区有数据(非空 ${NZ}B)"
+  fi
+fi
+
+echo "--- /boot 引导配置 ---"
+[ -f /boot/fnEnv.txt ] && OK "fnEnv.txt 存在" || BAD "fnEnv.txt 丢失"
+FDT=$(sed -n 's/^fdtfile=//p' /boot/fnEnv.txt 2>/dev/null)
+KRN=$(sed -n 's/^kernelfile=//p' /boot/fnEnv.txt 2>/dev/null)
+echo "  fdtfile=$FDT"
+echo "  kernelfile=$KRN"
+case "$FDT" in
+  *mpp-hevc*)
+    BAD "fdtfile 用的是 rk3399-smart-am40-mpp-hevc.dtb —— 已实测会把板子卡死，换回 rk3399-smart-am40-mpp.dtb";;
+esac
+[ -f "/boot/$KRN" ] && OK "内核文件 /boot/$KRN 存在 ($(stat -c%s /boot/$KRN) B)" || BAD "内核文件 /boot/$KRN 不存在！"
+[ -f "/boot/dtb/$FDT" ] && OK "设备树 /boot/dtb/$FDT 存在" || BAD "设备树 /boot/dtb/$FDT 不存在！"
+for v in fdtfile kernelfile; do
+  n=$(grep -c "^$v=" /boot/fnEnv.txt 2>/dev/null)
+  [ "$n" -gt 1 ] && BAD "fnEnv.txt 里 $v 出现 $n 次（U-Boot 用最后一行，容易踩坑）"
+done
+readlink -f /boot/vmlinuz >/dev/null 2>&1 && echo "  vmlinuz -> $(readlink /boot/vmlinuz)"
+KCOUNT=$(ls /boot/vmlinuz-* 2>/dev/null | wc -l)
+echo "  可回滚内核数: $KCOUNT"
+avail=$(df -m /boot | awk 'NR==2{print $4}')
+[ "$avail" -lt 40 ] && BAD "/boot 只剩 ${avail}MB，装新内核会爆" || OK "/boot 剩余 ${avail}MB"
+
+echo "--- AM40 设备树 ---"
+for f in rk3399-smart-am40.dtb rk3399-smart-am40-gpu.dtb rk3399-smart-am40-mpp.dtb \
+         rk3399-smart-am40-mpp-full.dtb rk3399-smart-am40-mpp-rga.dtb; do
+  if [ -f "/boot/dtb/rockchip/$f" ]; then
+    m=$(md5sum "/boot/dtb/rockchip/$f" | cut -d' ' -f1)
+    case "$f" in
+      rk3399-smart-am40-mpp.dtb)      want="$DTB_MPP_MD5";;
+      rk3399-smart-am40-mpp-full.dtb) want="$DTB_FULL_MD5";;
+      rk3399-smart-am40-mpp-rga.dtb)  want="$DTB_RGA_MD5";;
+      *) want="";;
+    esac
+    if [ -n "$want" ] && [ "$m" != "$want" ]; then
+      BAD "$f md5 $m != $want （可能被内核更新覆盖了，MPP/RGA 会失效）"
+    else
+      OK "$f present ($m)"
+    fi
+  else
+    case "$f" in
+      rk3399-smart-am40-mpp-full.dtb|rk3399-smart-am40-mpp-rga.dtb) WARN "$f 不存在（回滚/升级用的备份，缺了不影响当前启动）";;
+      *) BAD "$f 丢失";;
+    esac
+  fi
+done
+# 当前 fdtfile 到底是不是"满编 MPP + RGA"那一版
+case "$FDT" in
+  *mpp-rga*) OK "当前 fdtfile 是满编 MPP + RGA 修正版 ($FDT)";;
+  *mpp-full*) WARN "当前 fdtfile 是满编 MPP 但没有 RGA 修正 ($FDT) —— mediasrv 会因缺 /dev/rga 崩";;
+  *mpp.dtb) BAD "当前 fdtfile 是半编 MPP ($FDT) —— HEVC/VP9 不能硬解";;
+esac
+
+echo "--- 硬件编解码 (MPP) ---"
+bound() { ls /sys/bus/platform/drivers/$1/ 2>/dev/null | grep -vE '^(module|bind|unbind|uevent)$' | head -1; }
+[ -c /dev/mpp_service ] && OK "/dev/mpp_service 存在" || BAD "/dev/mpp_service 不存在（MPP 没起来）"
+[ -n "$(bound mpp_vdpu2)" ] && OK "VDPU2 已绑定 ($(bound mpp_vdpu2))" || BAD "VDPU2 未绑定"
+[ -n "$(bound mpp_vepu2)" ] && OK "VEPU2 已绑定 ($(bound mpp_vepu2))" || BAD "VEPU2 未绑定"
+if [ -n "$(bound mpp_rkvdec)" ]; then
+  OK "RKV(HEVC/VP9) 已绑定 ($(bound mpp_rkvdec))  ← 满编 MPP"
+else
+  case "$FDT" in
+    *mpp-full*) BAD "用的是满编 DTB，但 mpp_rkvdec 没绑定（模块没编 rk3399 支持？）";;
+    *) WARN "mpp_rkvdec 未绑定 —— 当前 DTB 是半编 MPP（只支持 H.264 等），HEVC/VP9 只能软解";;
+  esac
+fi
+$SUDO dmesg 2>/dev/null | grep -qE "mpp-srv: probe success|custom-rk3399" && OK "mpp-srv probe success（dmesg）" || WARN "dmesg 里没有 mpp-srv 记录（可能是环形缓冲滚掉了，上面设备检查为准）"
+# 模块版本：v3 修掉了每帧一次 iommu_set_fault_handler() WARN（那一版编解码慢一倍）
+MPPV=$(cat /proc/mpp_service/version 2>/dev/null)
+case "$MPPV" in
+  *full-v3*|*full-v4*|*full-v5*) OK "MPP 模块版本 $MPPV（已含每帧 WARN 修复）";;
+  *full-v2*) BAD "MPP 模块是 $MPPV —— 每帧会打一次 iommu_set_fault_handler WARN，编解码慢一倍；换回 /boot/rk_vcodec.ko.rk3399-full-v3";;
+  *) WARN "MPP 模块版本 [$MPPV] 不是 AM40 满编版";;
+esac
+# 那个 WARN 的特征：dmesg 里 iommu_set_fault_handler + mpp_iommu_dev_activate
+NW=$($SUDO dmesg 2>/dev/null | grep -c "iommu_set_fault_handler")
+if [ "${NW:-0}" -gt 20 ]; then
+  BAD "dmesg 里有 $NW 条 iommu_set_fault_handler WARN —— 模块是旧的 v2，编解码慢一倍（见 AM40-NOTES）"
+elif [ "${NW:-0}" -gt 0 ]; then
+  WARN "dmesg 里有 $NW 条 iommu_set_fault_handler WARN（少量是历史残留）"
+else
+  OK "dmesg 无 iommu_set_fault_handler WARN"
+fi
+if [ -c /dev/mpp_service ]; then
+  p=$(stat -c '%a %U:%G' /dev/mpp_service)
+  case "$p" in "660 root:video") OK "/dev/mpp_service $p";; *) BAD "/dev/mpp_service 权限 $p（应为 660 root:video，跑 /boot/99-am40-mpp.rules 那三条命令）";; esac
+else
+  BAD "/dev/mpp_service 不存在"
+fi
+
+echo "--- 2D 加速 (RGA) ---"
+# 飞牛自带 rga3.ko(vendor multi-RGA) 的 of_match 只有 "rockchip,rga2"/"rockchip,rga3*"，
+# 原 mainline 的 "rockchip,rk3399-rga" 匹配不上 -> 模块 init 直接失败 -> 没有 /dev/rga
+# -> librga.so 一调用就 SEGV -> mediasrv 崩。修法见 rk3399-smart-am40-mpp-rga.dtb。
+if lsmod 2>/dev/null | grep -q '^rga3'; then
+  OK "rga3 模块已加载"
+  RGAB="$(bound rga2)"
+  if [ -n "$RGAB" ]; then
+    OK "rga2 驱动已绑定 ($RGAB)"
+  else
+    RGAB="$(bound rga3)"
+    [ -n "$RGAB" ] && OK "rga3 驱动已绑定 ($RGAB)" || BAD "rga3 模块加载了但没有任何调度器绑定到 DT 节点（compatible 不对？）"
+  fi
+  $SUDO dmesg 2>/dev/null | grep -qE "rga2 ff680000.rga: probe successfully|rga: Module initialized" \
+    && OK "RGA probe success（dmesg）" || WARN "dmesg 里没有 RGA probe 记录"
+else
+  BAD "rga3 模块没加载 —— mediasrv 会因为缺 /dev/rga 直接崩（检查 /etc/modules-load.d/trim-rk_vcodec.conf）"
+fi
+if [ -c /dev/rga ]; then
+  p=$(stat -c '%a %U:%G' /dev/rga)
+  case "$p" in "660 root:video") OK "/dev/rga $p";; *) WARN "/dev/rga 权限 $p（正常应为 660 root:video）";; esac
+else
+  BAD "/dev/rga 不存在 —— librga 会崩，mediasrv 起不来。把 fdtfile 换成 rk3399-smart-am40-mpp-rga.dtb 后重启"
+fi
+
+echo "--- mediasrv 兼容垫片 (AV1 软解 / HEVC 编码回退) ---"
+# RK3399 没有 AV1/VP8 硬解、也没有 HEVC 硬编；垫片拦住这两类请求，否则播放报 errno 4096。
+SHIM_SO=/usr/local/lib/mediasrv-shim.so
+SHIM_DROPIN=/etc/systemd/system/mediasrv.service.d/10-am40-shim.conf
+[ -f "$SHIM_SO" ] && OK "垫片 $SHIM_SO 存在" || BAD "垫片 $SHIM_SO 丢失 —— 跑 sudo am40-fix-mediasrv 重装"
+if [ -f "$SHIM_DROPIN" ]; then
+  grep -q LD_PRELOAD "$SHIM_DROPIN" && OK "drop-in 已挂上 LD_PRELOAD" || BAD "drop-in 里没有 LD_PRELOAD"
+else
+  BAD "drop-in $SHIM_DROPIN 丢失（系统更新可能覆盖）—— 跑 sudo am40-fix-mediasrv"
+fi
+MP=$(pgrep -x mediasrv | head -1)
+if [ -n "$MP" ]; then
+  if tr '\0' '\n' < "/proc/$MP/environ" 2>/dev/null | grep -q mediasrv-shim; then
+    OK "mediasrv 已加载垫片 (pid $MP)"
+  else
+    BAD "mediasrv 没加载垫片 —— AV1 播放/HEVC 编码会报错，跑 sudo am40-fix-mediasrv"
+  fi
+else
+  BAD "mediasrv 没在跑（该服务已 enable，正常开机自启）"
+fi
+
+echo "--- 网络 ---"
+for n in /sys/class/net/*; do
+  i=$(basename "$n"); [ "$i" = lo ] && continue
+  st=$(cat "$n/operstate" 2>/dev/null)
+  sp=$(cat "$n/speed" 2>/dev/null)
+  echo "  $i: $st ${sp:+${sp}Mb/s} $(ip -4 -br addr show $i 2>/dev/null | awk '{print $3}')"
+done
+[ "$(cat /sys/class/net/eth0/speed 2>/dev/null)" = 1000 ] && OK "eth0 千兆" || WARN "eth0 不是 1000Mb/s"
+
+echo "--- 存储 / 容量 ---"
+df -h / /boot /vol1 /vol2 2>/dev/null | awk 'NR==1||!seen[$1]++' | sed 's/^/  /'
+echo "--- md / 温度 / 服务 ---"
+grep -E "^(md|Personalities)" /proc/mdstat 2>/dev/null | sed 's/^/  /'
+for z in /sys/class/thermal/thermal_zone*/; do
+  t=$(cat "$z/temp" 2>/dev/null); echo "  $(cat $z/type): $((t/1000))C"
+done
+if systemctl list-unit-files mediasrv.service >/dev/null 2>&1; then
+  nr=$(systemctl show mediasrv -p NRestarts --value 2>/dev/null)
+  as=$(systemctl show mediasrv -p ActiveState --value 2>/dev/null)
+  case "$as$nr" in
+    *0) OK "mediasrv 正常 (state=$as restarts=$nr)";;
+    *) if [ "$as" = "failed" ] || [ "$as" = "activating" ] || [ "${nr:-0}" -gt 5 ]; then
+         BAD "mediasrv 崩溃重启中 (state=$as restarts=$nr) —— 先看上面 /dev/rga 检查；缺 RGA 就去 /boot 把 fdtfile 换成 rk3399-smart-am40-mpp-rga.dtb"
+       else OK "mediasrv (state=$as restarts=$nr)"; fi;;
+  esac
+fi
+echo
+echo "=================== 结果: OK=$ok FAIL=$bad ==================="
+[ "$bad" = 0 ] || exit 1

@@ -1,0 +1,47 @@
+========================================================================
+0002 — 去掉每帧一次的内核 WARN（吞吐减半的真凶）
+========================================================================
+mpp_iommu_dev_activate() 每次激活设备都调用一次 iommu_set_fault_handler()，
+而 6.18 起该 API 已废弃（domain->ops->set_fault_handler == NULL），
+于是每帧触发一次 WARN_ON + 打印整页调用栈（含 1.5KB 模块清单）。
+fnEnv.txt 里 console=both 时这些 printk 同时刷串口与 HDMI 控制台，
+实测 300 帧产生 287 条 WARN，吞吐直接减半：
+    1080p H.264 编码 0.66x -> 1.22x   解码 1.37x -> 10.8x
+6.18 的 rockchip-iommu 自己在中断里就会报 page fault，驱动无需再注册。
+
+本补丁把该调用 #if 0 掉，并给 mpp_iommu_handle 加 __maybe_unused。
+需先应用 0001。
+========================================================================
+
+diff --git a/mpp/mpp_iommu.c b/mpp/mpp_iommu.c
+--- a/mpp/mpp_iommu.c
++++ b/mpp/mpp_iommu.c
+@@ -471,7 +471,7 @@
+ 	return iommu_attach_group(info->domain, info->group);
+ }
+ 
+-static int mpp_iommu_handle(struct iommu_domain *iommu,
++static int __maybe_unused mpp_iommu_handle(struct iommu_domain *iommu,
+ 			    struct device *iommu_dev,
+ 			    unsigned long iova,
+ 			    int status, void *arg)
+@@ -651,9 +651,18 @@
+ 		ret = -EINVAL;
+ 	} else {
+ 		info->dev_active = dev;
+-		/* switch domain pagefault handler and arg depending on device */
++		/*
++		 * AM40 patch: 6.18 起 iommu_set_fault_handler() 已废弃 ——
++		 * domain->ops->set_fault_handler 为 NULL，每调用一次就 WARN_ON 并
++		 * 打印整页调用栈（console=both 时同时刷串口+tty1）。这个函数是
++		 * "每次激活设备"都调一次的，实测等于每帧一次：1080p H.264
++		 * 编码 0.66x->1.17x、解码 1.37x->9.2x 全是被这个 printk 拖掉的。
++		 * 6.18 的 rockchip-iommu 自己会在中断里报 page fault，这里不再注册。
++		 */
++#if 0
+ 		iommu_set_fault_handler(info->domain, dev->fault_handler ?
+ 					dev->fault_handler : mpp_iommu_handle, dev);
++#endif
+ 
+ 		dev_dbg(info->dev, "activate -> %p %s\n", dev, dev_name(dev->dev));
+ 	}

@@ -1,0 +1,154 @@
+========================================================================
+AM40 设备树改动（相对 fnOS 出厂 DTB）
+========================================================================
+基准：rk3399-smart-am40.dtb（fnOS 出厂，md5 3373c03f7a971d98b7ea1584906567ee）
+目标：rk3399-smart-am40-mpp-rga.dts（满编 MPP + RGA 修正，md5 21d879e3618f6f49498d629139a6d0c3）
+
+三处改动：
+  1. rga@ff680000 的 compatible: "rockchip,rk3399-rga" -> "rockchip,rga2"
+     理由：飞牛只发 vendor 版 rga3.ko，它的 of_match 只认 rockchip,rga2 / rockchip,rga3*；
+           出厂 DTB 用的是上游 mainline 的名字，导致模块 init 直接 -EFAULT，
+           没有 /dev/rga，librga 一调用就崩，mediasrv 随之 SEGV。
+  2. 新增 vendor MPP 绑定节点：mpp-srv / vepu@ff650000 / vdpu@ff650400 / rkvdec@ff660000
+     理由：vendor MPP 需要 compatible + rockchip,srv + taskqueue-node + resetgroup-node；
+           mainline 的 video-codec@ff650000 / @ff660000 没有这些属性，RK3399 的
+           HEVC/VP9/4K 解码器（ff660000）根本没被绑定。
+  3. 把 mainline 的 video-codec@ff660000 / vpu@ff650000 置 status = "disabled"
+     理由：避免两个驱动抢同一块地址。
+
+编译：
+    dtc -I dts -O dtb -o rk3399-smart-am40-mpp-rga.dtb rk3399-smart-am40-mpp-rga.dts
+应用（已有出厂 DTB 时）：
+    dtc -I dtb -O dts -o stock.dts /boot/dtb/rockchip/rk3399-smart-am40.dtb
+    patch -p0 stock.dts < am40-dtb.patch     # 然后重新编译
+注：RGA 那一项也可以只用一个属性命令完成，不需要整棵 DTB：
+    fdtput -t s <dtb> /rga@ff680000 compatible "rockchip,rga2"
+========================================================================
+
+--- a/rk3399-smart-am40.dts
++++ b/rk3399-smart-am40-mpp-rga.dts
+@@ -1594,16 +1594,45 @@
+ 		phandle = <0x106>;
+ 	};
+ 
+-	video-codec@ff650000 {
+-		compatible = "rockchip,rk3399-vpu";
+-		reg = <0x00 0xff650000 0x00 0x800>;
+-		interrupts = <0x00 0x72 0x04 0x00 0x00 0x71 0x04 0x00>;
+-		interrupt-names = "vepu", "vdpu";
++	mpp_srv: mpp-srv {
++		compatible = "rockchip,mpp-service";
++		rockchip,taskqueue-count = <0x02>;
++		rockchip,resetgroup-count = <0x02>;
++		status = "okay";
++	};
++
++	vepu@ff650000 {
++		compatible = "rockchip,vpu-encoder-v2";
++		reg = <0x00 0xff650000 0x00 0x400>;
++		interrupts = <0x00 0x72 0x04 0x00>;
++		interrupt-names = "irq_enc";
+ 		clocks = <0x08 0xeb 0x08 0x1ea>;
+-		clock-names = "aclk", "hclk";
++		clock-names = "aclk_vcodec", "hclk_vcodec";
++		rockchip,normal-rates = <0x11e1a300 0x00>;
++		rockchip,advanced-rates = <0x11e1a300 0x00>;
+ 		iommus = <0x87>;
+ 		power-domains = <0x18 0x1f>;
+-		phandle = <0x107>;
++		rockchip,srv = <&mpp_srv>;
++		rockchip,taskqueue-node = <0x00>;
++		rockchip,resetgroup-node = <0x00>;
++		status = "okay";
++	};
++
++	vdpu@ff650400 {
++		compatible = "rockchip,vpu-decoder-v2";
++		reg = <0x00 0xff650400 0x00 0x400>;
++		interrupts = <0x00 0x71 0x04 0x00>;
++		interrupt-names = "irq_dec";
++		clocks = <0x08 0xeb 0x08 0x1ea>;
++		clock-names = "aclk_vcodec", "hclk_vcodec";
++		rockchip,normal-rates = <0x11e1a300 0x00>;
++		rockchip,advanced-rates = <0x11e1a300 0x00>;
++		iommus = <0x87>;
++		power-domains = <0x18 0x1f>;
++		rockchip,srv = <&mpp_srv>;
++		rockchip,taskqueue-node = <0x00>;
++		rockchip,resetgroup-node = <0x00>;
++		status = "okay";
+ 	};
+ 
+ 	iommu@ff650800 {
+@@ -1627,6 +1656,27 @@
+ 		iommus = <0x88>;
+ 		power-domains = <0x18 0x20>;
+ 		phandle = <0x108>;
++		status = "disabled";
++	};
++
++	/* === 官方 6.1 BSP 风格：RKV(HEVC/VP9 4K) 交给 vendor MPP === */
++	rkvdec@ff660000 {
++		compatible = "rockchip,rkv-decoder-rk3399";
++		reg = <0x00 0xff660000 0x00 0x400>;
++		interrupts = <0x00 0x74 0x04 0x00>;
++		interrupt-names = "irq_dec";
++		clocks = <0x08 0xed 0x08 0x1ec 0x08 0x9f 0x08 0x9e>;
++		clock-names = "aclk_vcodec", "hclk_vcodec", "clk_cabac", "clk_core";
++		rockchip,normal-rates = <0x11e1a300 0x00 0x11e1a300 0x11e1a300>;
++		rockchip,advanced-rates = <0x11e1a300 0x00 0x11e1a300 0x11e1a300>;
++		resets = <0x08 0x5b 0x08 0x59 0x08 0x5a 0x08 0x58 0x08 0x5d 0x08 0x5c>;
++		reset-names = "video_h", "video_a", "niu_h", "niu_a", "video_cabac", "video_core";
++		iommus = <0x88>;
++		power-domains = <0x18 0x20>;
++		rockchip,srv = <&mpp_srv>;
++		rockchip,taskqueue-node = <0x01>;
++		rockchip,resetgroup-node = <0x01>;
++		status = "okay";
+ 	};
+ 
+ 	iommu@ff660480 {
+@@ -1666,8 +1716,11 @@
+ 		phandle = <0x89>;
+ 	};
+ 
++	/* === 修正：飞牛自带 rga3.ko(vendor multi-RGA) 只认 "rockchip,rga2"，
++	 * 原 mainline compatible "rockchip,rk3399-rga" 无驱动匹配 -> /dev/rga 不存在
++	 * -> librga.so 崩 -> mediasrv SEGV。参见 6.1 BSP rk3399-linux.dtsi === */
+ 	rga@ff680000 {
+-		compatible = "rockchip,rk3399-rga";
++		compatible = "rockchip,rga2";
+ 		reg = <0x00 0xff680000 0x00 0x10000>;
+ 		interrupts = <0x00 0x37 0x04 0x00>;
+ 		clocks = <0x08 0xdc 0x08 0x1e5 0x08 0x6d>;
+@@ -2364,16 +2417,17 @@
+ 	};
+ 
+ 	gpu@ff9a0000 {
+-		compatible = "rockchip,rk3399-mali", "arm,mali-t860";
++		compatible = "arm,mali-t860", "rockchip,rk3399-mali";
+ 		reg = <0x00 0xff9a0000 0x00 0x10000>;
+-		interrupts = <0x00 0x14 0x04 0x00 0x00 0x15 0x04 0x00 0x00 0x13 0x04 0x00>;
+-		interrupt-names = "job", "mmu", "gpu";
++		interrupts = <0x00 0x13 0x04 0x00 0x00 0x14 0x04 0x00 0x00 0x15 0x04 0x00>;
++		interrupt-names = "GPU", "JOB", "MMU";
+ 		clocks = <0x08 0xd0>;
++		clock-names = "clk_mali";
+ 		#cooling-cells = <0x02>;
+ 		power-domains = <0x18 0x23>;
+-		status = "okay";
+ 		operating-points-v2 = <0xab>;
+ 		mali-supply = <0xac>;
++		status = "okay";
+ 		phandle = <0x5a>;
+ 	};
+ 
+@@ -3788,7 +3842,7 @@
+ 		pwm3 = "/pwm@ff420030";
+ 		vpu = "/video-codec@ff650000";
+ 		vpu_mmu = "/iommu@ff650800";
+-		vdec = "/video-codec@ff660000";
++		vdec = "/rkvdec@ff660000";
+ 		vdec_mmu = "/iommu@ff660480";
+ 		iep = "/iep@ff670000";
+ 		iep_mmu = "/iommu@ff670800";

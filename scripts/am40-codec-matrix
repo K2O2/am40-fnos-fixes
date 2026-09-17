@@ -1,0 +1,160 @@
+#!/bin/bash
+# AM40 / RK3399 硬件编解码能力全量实测
+# 结果: /tmp/codec_matrix.log      汇总行格式: RESULT|<编码>|<路径>|<OK|FAIL|TIMEOUT>|<帧>|<speed>|<备注>
+L=/tmp/codec_matrix.log
+exec >"$L" 2>&1
+FF="ffmpeg -hide_banner -nostdin"
+TMO=90
+
+res() { printf 'RESULT|%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-0}" "${5:--}" "${6:-}"; }
+
+# dec <编码> <路径> <解码器> <文件>
+dec() {
+  local name="$1" path="$2" cdec="$3" file="$4"
+  printf '[%s] %-28s %s ... ' "$name" "$path" "$cdec"
+  if [ ! -s "$file" ]; then echo "无样片"; res "$name" "$path" SKIP 0 - no-sample; return; fi
+  local out; out=$(timeout $TMO ffmpeg -hide_banner -nostdin -c:v "$cdec" -i "$file" -f null - 2>&1); local rc=$?
+  local fr sp err
+  fr=$(echo "$out" | grep -oE 'frame= *[0-9]+' | tail -1 | tr -dc 0-9); fr=${fr:-0}
+  sp=$(echo "$out" | grep -oE 'speed=[0-9.]+x' | tail -1 | cut -d= -f2); sp=${sp:--}
+  err=$(echo "$out" | grep -iE 'error|not support|unsupported|Invalid|failed' | tail -1 | cut -c1-80)
+  if [ $rc -eq 0 ] && [ "$fr" -gt 0 ]; then echo "OK $fr 帧 $sp"; res "$name" "$path" OK "$fr" "$sp" "$cdec"
+  elif [ $rc -eq 124 ]; then echo "TIMEOUT"; res "$name" "$path" TIMEOUT 0 - "$cdec 卡住"
+  else echo "FAIL rc=$rc $err"; res "$name" "$path" FAIL "$fr" "$sp" "$cdec ${err}"; fi
+}
+
+# gen <文件名> <参数...>
+gen() { local f="$1"; shift; timeout 180 ffmpeg -hide_banner -nostdin -loglevel error -f lavfi -i "testsrc2=size=$SRC:rate=30" -frames:v "$NFR" "$@" -y "$f" 2>/dev/null; }
+
+echo "########## 0. 环境 ##########"
+date; uname -r; tr -d '\0' < /proc/device-tree/model; echo
+echo "-- 设备: $(ls /dev/mpp_service /dev/video* /dev/rga /dev/mali0 2>&1 | tr '\n' ' ')"
+echo "-- mpp 绑定:"; for d in /sys/bus/platform/drivers/mpp*; do printf '   %-12s ' "$(basename $d)"; ls "$d" 2>/dev/null | grep -vE '^(module|bind|unbind|uevent)$' | tr '\n' ' '; echo; done
+echo "-- mpp 探测日志:"; dmesg 2>/dev/null | grep -iE 'mpp' | tail -8
+echo "-- CMA/内存:"; grep -E 'CmaTotal|CmaFree|MemTotal|MemAvailable' /proc/meminfo
+echo "-- ffmpeg:"; ffmpeg -hide_banner -version 2>/dev/null | head -2
+echo "-- rga/v4l2 相关 filter:"; ffmpeg -hide_banner -filters 2>/dev/null | grep -iE 'rga|v4l2|hwmap|hwupload|hwdownload' | awk '{print "   "$2}'
+echo "-- hwaccels:"; ffmpeg -hide_banner -hwaccels 2>/dev/null | tail -n +2 | tr '\n' ' '; echo
+
+echo "########## 1. 可用编解码器 ##########"
+echo "-- rkmpp 解码:"; ffmpeg -hide_banner -decoders 2>/dev/null | grep -i rkmpp | awk '{print "   "$2}' | tr '\n' ' '; echo
+echo "-- rkmpp 编码:"; ffmpeg -hide_banner -encoders 2>/dev/null | grep -i rkmpp | awk '{print "   "$2}' | tr '\n' ' '; echo
+echo "-- v4l2m2m 解码:"; ffmpeg -hide_banner -decoders 2>/dev/null | grep -i v4l2m2m | awk '{print "   "$2}' | tr '\n' ' '; echo
+echo "-- v4l2m2m 编码:"; ffmpeg -hide_banner -encoders 2>/dev/null | grep -i v4l2m2m | awk '{print "   "$2}' | tr '\n' ' '; echo
+echo "-- 软件解码(参考):"; for c in libdav1d av1 vp9 hevc h264 mpeg2video vc1 mjpeg; do ffmpeg -hide_banner -decoders 2>/dev/null | awk -v c="$c" '$2==c{print "   "$2}'; done | tr '\n' ' '; echo
+echo "-- 软件编码(造样片用):"; for c in libx264 libx265 libvpx libvpx-vp9 libaom-av1 libsvtav1 mjpeg mpeg4 mpeg2video mpeg1video h263; do ffmpeg -hide_banner -encoders 2>/dev/null | awk -v c="$c" '$2==c{print "   "$2}'; done | tr '\n' ' '; echo
+
+SRC=1920x1080; NFR=60
+echo "########## 2. 生成样片 (${SRC} x ${NFR} 帧) ##########"
+gen /tmp/c_h264.mp4  -c:v libx264 -preset ultrafast
+gen /tmp/c_hevc.mp4  -c:v libx265 -preset ultrafast -x265-params log-level=error
+gen /tmp/c_hevc10.mp4 -c:v libx265 -preset ultrafast -pix_fmt yuv420p10le -x265-params log-level=error
+gen /tmp/c_mjpeg.avi -c:v mjpeg -q:v 3
+gen /tmp/c_mpeg1.mpg -c:v mpeg1video -q:v 5
+gen /tmp/c_mpeg2.mpg -c:v mpeg2video -q:v 5
+gen /tmp/c_mpeg4.mp4 -c:v mpeg4 -q:v 5
+gen /tmp/c_h263.3gp -c:v h263 -s 704x576
+gen /tmp/c_vp8.webm -c:v libvpx -b:v 4M
+gen /tmp/c_vp9.webm -c:v libvpx-vp9 -b:v 4M -deadline realtime -cpu-used 8
+gen /tmp/c_vp9_10.webm -c:v libvpx-vp9 -b:v 4M -pix_fmt yuv420p10le -deadline realtime -cpu-used 8
+(timeout 240 ffmpeg -hide_banner -nostdin -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 30 -c:v libaom-av1 -cpu-used 8 -y /tmp/c_av1.mkv 2>/dev/null) || \
+(timeout 240 ffmpeg -hide_banner -nostdin -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 30 -c:v libsvtav1 -preset 12 -y /tmp/c_av1.mkv 2>/dev/null) || echo "  (无 AV1 编码器，跳过)"
+timeout 60 ffmpeg -hide_banner -nostdin -loglevel error -f lavfi -i testsrc2=size=1920x1080:rate=1 -frames:v 1 -q:v 2 -y /tmp/c_pic.jpg 2>/dev/null
+for f in /tmp/c_*.mp4 /tmp/c_*.webm /tmp/c_*.mkv /tmp/c_*.avi /tmp/c_*.mpg /tmp/c_*.3gp /tmp/c_pic.jpg; do [ -s "$f" ] && printf '   %8s  %s\n' "$(stat -c%s "$f")" "$f"; done
+
+echo "########## 3. 解码能力矩阵 ##########"
+# H.264
+dec H.264 "MPP rkmpp"    h264_rkmpp   /tmp/c_h264.mp4
+dec H.264 "V4L2 v4l2m2m" h264_v4l2m2m /tmp/c_h264.mp4
+dec H.264 "软解"          h264         /tmp/c_h264.mp4
+# H.265 8bit
+dec H.265-8 "MPP rkmpp"    hevc_rkmpp   /tmp/c_hevc.mp4
+dec H.265-8 "V4L2 v4l2m2m" hevc_v4l2m2m /tmp/c_hevc.mp4
+dec H.265-8 "软解"          hevc         /tmp/c_hevc.mp4
+# H.265 10bit
+dec H.265-10 "MPP rkmpp"    hevc_rkmpp   /tmp/c_hevc10.mp4
+dec H.265-10 "V4L2 v4l2m2m" hevc_v4l2m2m /tmp/c_hevc10.mp4
+# VP8
+dec VP8 "MPP rkmpp"    vp8_rkmpp    /tmp/c_vp8.webm
+dec VP8 "V4L2 v4l2m2m" vp8_v4l2m2m  /tmp/c_vp8.webm
+# VP9
+dec VP9 "MPP rkmpp"    vp9_rkmpp    /tmp/c_vp9.webm
+dec VP9 "V4L2 v4l2m2m" vp9_v4l2m2m  /tmp/c_vp9.webm
+# VP9 10bit
+dec VP9-10 "MPP rkmpp"    vp9_rkmpp    /tmp/c_vp9_10.webm
+dec VP9-10 "V4L2 v4l2m2m" vp9_v4l2m2m  /tmp/c_vp9_10.webm
+# AV1
+dec AV1 "MPP rkmpp"    av1_rkmpp    /tmp/c_av1.mkv
+dec AV1 "V4L2 v4l2m2m" av1_v4l2m2m  /tmp/c_av1.mkv
+dec AV1 "软解 dav1d"    libdav1d     /tmp/c_av1.mkv
+# MJPEG / JPEG
+dec MJPEG "MPP rkmpp"    mjpeg_rkmpp  /tmp/c_mjpeg.avi
+dec MJPEG "V4L2 v4l2m2m" mjpeg_v4l2m2m /tmp/c_mjpeg.avi
+dec JPEG  "MPP rkmpp"    mjpeg_rkmpp  /tmp/c_pic.jpg
+dec JPEG  "软解"          mjpeg        /tmp/c_pic.jpg
+# MPEG-1/2/4 / H.263
+dec MPEG1 "MPP rkmpp"    mpeg1_rkmpp  /tmp/c_mpeg1.mpg
+dec MPEG1 "V4L2 v4l2m2m" mpeg1_v4l2m2m /tmp/c_mpeg1.mpg
+dec MPEG2 "MPP rkmpp"    mpeg2_rkmpp  /tmp/c_mpeg2.mpg
+dec MPEG2 "V4L2 v4l2m2m" mpeg2_v4l2m2m /tmp/c_mpeg2.mpg
+dec MPEG4 "MPP rkmpp"    mpeg4_rkmpp  /tmp/c_mpeg4.mp4
+dec MPEG4 "V4L2 v4l2m2m" mpeg4_v4l2m2m /tmp/c_mpeg4.mp4
+dec H263  "MPP rkmpp"    h263_rkmpp   /tmp/c_h263.3gp
+dec H263  "V4L2 v4l2m2m" h263_v4l2m2m /tmp/c_h263.3gp
+res VC-1 "MPP rkmpp" SKIP 0 - "ffmpeg 无 VC-1 编码器,无法造样片"
+res VC-1 "V4L2 v4l2m2m" SKIP 0 - "同上"
+
+echo "########## 4. 编码能力矩阵 ##########"
+enc() { # enc <名称> <编码器> <输出> [码率] [分辨率]
+  local name="$1" cenc="$2" out="$3" br="${4:-4M}" sz="${5:-1920x1080}"
+  printf '[%s] %-24s ... ' "$name" "$cenc"
+  local o; o=$(timeout $TMO ffmpeg -hide_banner -nostdin -f lavfi -i "testsrc2=size=$sz:rate=30" -frames:v 60 -c:v "$cenc" -b:v "$br" -y "$out" 2>&1); local rc=$?
+  local sp s; sp=$(echo "$o" | grep -oE 'speed=[0-9.]+x' | tail -1 | cut -d= -f2); sp=${sp:--}
+  s=$(stat -c%s "$out" 2>/dev/null || echo 0)
+  local err; err=$(echo "$o" | grep -iE 'error|not support|unsupported|Invalid' | tail -1 | cut -c1-80)
+  if [ $rc -eq 0 ] && [ "$s" -gt 1000 ]; then echo "OK $((s/1024))KB $sp"; res "ENC-${name}" "$cenc" OK 60 "$sp" "$sz $((s/1024))KB"
+  elif [ $rc -eq 124 ]; then echo "TIMEOUT"; res "ENC-${name}" "$cenc" TIMEOUT 0 - "$sz 卡住"
+  else echo "FAIL rc=$rc $err"; res "ENC-${name}" "$cenc" FAIL 0 "$sp" "$err"; fi
+}
+enc H264-MPP     h264_rkmpp        /tmp/e_h264_mpp.mkv  4M 1920x1080
+enc H264-MPP-4K  h264_rkmpp        /tmp/e_h264_4k.mkv   8M 3840x2160
+enc H264-V4L2    h264_v4l2m2m      /tmp/e_h264_v4l2.mkv 4M 1920x1080
+enc HEVC-MPP     hevc_rkmpp        /tmp/e_hevc_mpp.mkv  4M 1920x1080
+enc HEVC-V4L2    hevc_v4l2m2m      /tmp/e_hevc_v4l2.mkv 4M 1920x1080
+enc MJPEG-MPP    mjpeg_rkmpp       /tmp/e_mjpeg_mpp.avi 4M 1920x1080
+enc MJPEG-软      mjpeg             /tmp/e_mjpeg_sw.avi  4M 1920x1080
+enc H264-x264    libx264           /tmp/e_x264.mkv      4M 1920x1080
+enc HEVC-x265    libx265           /tmp/e_x265.mkv      4M 1920x1080
+
+echo "########## 5. 转码管线（解→编） ##########"
+pipe() { local name="$1"; shift
+  printf '%-46s ... ' "$name"
+  local o; o=$(timeout 120 "$@" 2>&1); local rc=$?
+  local sp; sp=$(echo "$o" | grep -oE 'speed=[0-9.]+x' | tail -1 | cut -d= -f2); sp=${sp:--}
+  local err; err=$(echo "$o" | grep -iE 'error|unsupported|Invalid|Cannot|No such' | tail -1 | cut -c1-90)
+  if [ $rc -eq 0 ]; then echo "OK $sp"; res "PIPE-${name}" "dec+enc" OK 0 "$sp" ""
+  elif [ $rc -eq 124 ]; then echo "TIMEOUT"; res "PIPE-${name}" "dec+enc" TIMEOUT 0 - "卡住"
+  else echo "FAIL rc=$rc $err"; res "PIPE-${name}" "dec+enc" FAIL 0 "$sp" "$err"; fi
+}
+pipe "H.265(V4L2) → hwdownload → H.264(MPP)"  ffmpeg -hide_banner -nostdin -c:v hevc_v4l2m2m -i /tmp/c_hevc.mp4 -vf "hwdownload,format=nv12,hwupload=derive_device=rkmpp" -c:v h264_rkmpp -b:v 4M -y /tmp/p_hw.mkv
+pipe "H.265(V4L2) → hwmap→rkmpp → H.264(MPP)"  ffmpeg -hide_banner -nostdin -c:v hevc_v4l2m2m -i /tmp/c_hevc.mp4 -vf "hwmap=derive_device=rkmpp" -c:v h264_rkmpp -b:v 4M -y /tmp/p_map.mkv
+pipe "H.265(软解) → H.264(MPP)"                 ffmpeg -hide_banner -nostdin -i /tmp/c_hevc.mp4 -c:v h264_rkmpp -b:v 4M -y /tmp/p_sw.mkv
+pipe "H.264(MPP) → H.264(MPP)"                  ffmpeg -hide_banner -nostdin -c:v h264_rkmpp -i /tmp/c_h264.mp4 -c:v h264_rkmpp -b:v 4M -y /tmp/p_h264.mkv
+pipe "VP9(V4L2) → hwdownload → H.264(MPP)"      ffmpeg -hide_banner -nostdin -c:v vp9_v4l2m2m -i /tmp/c_vp9.webm -vf "hwdownload,format=nv12,hwupload=derive_device=rkmpp" -c:v h264_rkmpp -b:v 4M -y /tmp/p_vp9.mkv
+pipe "4K H.265(V4L2) → 1080p → H.264(MPP)"      ffmpeg -hide_banner -nostdin -c:v hevc_v4l2m2m -i /tmp/c_4khevc.mp4 -vf "hwdownload,scale=1920:1080,format=nv12,hwupload=derive_device=rkmpp" -c:v h264_rkmpp -b:v 6M -y /tmp/p_4k.mkv
+[ -c /dev/rga ] && pipe "RGA 缩放: hevc_v4l2m2m → scale_rkrga → h264_rkmpp" ffmpeg -hide_banner -nostdin -c:v hevc_v4l2m2m -i /tmp/c_hevc.mp4 -vf "scale_rkrga=w=1280:h=720:format=nv12" -c:v h264_rkmpp -b:v 4M -y /tmp/p_rga.mkv
+for f in /tmp/p_*.mkv; do [ -s "$f" ] && printf '   %10s %s\n' "$(stat -c%s "$f")" "$f"; done
+
+echo "########## 6. 4K H.265 解码 ##########"
+SRC=3840x2160; NFR=30
+gen /tmp/c_4khevc.mp4 -c:v libx265 -preset ultrafast -x265-params log-level=error
+if [ -s /tmp/c_4khevc.mp4 ]; then
+  dec "4K-H265" "V4L2 v4l2m2m" hevc_v4l2m2m /tmp/c_4khevc.mp4
+  dec "4K-H265" "MPP rkmpp"    hevc_rkmpp   /tmp/c_4khevc.mp4
+  dec "4K-H265" "软解"          hevc         /tmp/c_4khevc.mp4
+else echo "  4K 样片生成失败"; fi
+
+echo
+echo "########## 汇总 ##########"
+grep '^RESULT|' "$L" | awk -F'|' '{printf "%-14s %-14s %-8s %4s  %-8s %s\n", $2,$3,$4,$5,$6,$7}'
+echo "DONE"

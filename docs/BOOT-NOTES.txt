@@ -1,0 +1,421 @@
+AM40 专用飞牛镜像 · 说明（v5，2026-09-16）
+基于 fnos_Mainland-PE_arm_1.2.0302_firefly-rk3399_2288.img 修改
+================================================================================
+
+【v5 关键改动 —— 镜像现在是"自给自足"的】
+飞牛官方镜像自带的 U-Boot 是给 Firefly-RK3399 编的（控制设备树
+firefly,firefly-rk3399），在 AM40 的板级初始化阶段就挂了 —— 现象正是
+【网口灯完全不亮、什么都没起来】，这就是 v1 起不来的根因。
+本镜像已把那套 U-Boot 替换成 AM40 上【已验证可用】的 Armbian U-Boot
+（从本机 eMMC 的 0~16MB 裸区提取，md5 43d1cb8be212412dc8b427ab254307ee）。
+
+=> 刷 SD 能从 SD 启动，刷 eMMC 能从 eMMC 启动，互不依赖。
+
+--------------------------------------------------------------------------------
+一、⭐ MPP 硬件编解码：已验证可用（默认开启）
+--------------------------------------------------------------------------------
+rk3399-smart-am40-mpp.dtb = 原版 DTB + mpp_srv + VDPU2/VEPU2 节点。
+启动后：
+    mpp_service mpp-srv: probe success
+    mpp_vdpu2 ff650400.vdpu: probing finish     ← H.264/VP8 硬解
+    mpp_vepu2 ff650000.vepu: probing finish     ← H.264 硬编
+    /dev/mpp_service 出现
+实测（/usr/bin/ffmpeg 自带 rkmpp）：
+    h264_rkmpp 编 720p x90  -> CBR 3.8Mbps，输出 1.41MB   ✔
+    h264_rkmpp 编 1080p x60 -> 输出 1.42MB                 ✔
+    h264_rkmpp 解 720p/1080p -> 60/90 帧全解，speed 6~7x    ✔
+HEVC/4K 解码仍走 mainline 的 V4L2 rkvdec（/dev/video0）。
+一句话：不用换内核就拿到了 H.264 硬解 + 硬编。
+
+  * 权限：/dev/mpp_service 默认 0600 root。重刷后执行一次（规则就在本分区）：
+        sudo cp /boot/99-am40-mpp.rules /etc/udev/rules.d/
+        sudo udevadm control --reload-rules && sudo udevadm trigger --action=change
+        sudo usermod -aG video $USER
+  * 已知副作用：飞牛自带的 mediasrv 发现 MPP 可用后会 SIGSEGV 无限重启
+    （日志 "mpp_platform: client 9 driver is not ready!" -> signal=SEGV）。
+    它自己的 bug。二选一：
+        sudo systemctl mask mediasrv          # 不要飞牛自带媒体服务
+        fdtfile 改回 rk3399-smart-am40.dtb    # 要 mediasrv，放弃 MPP
+    Jellyfin 用自己的 ffmpeg 走 /dev/mpp_service，不受影响。
+
+--------------------------------------------------------------------------------
+二、DTB 三选一（编辑本分区 fnEnv.txt 的 fdtfile，改完重启）
+--------------------------------------------------------------------------------
+  rk3399-smart-am40-mpp.dtb   【默认】原版 + MPP 节点
+  rk3399-smart-am40.dtb       原版，与 AM40 原系统逐字节相同（最保守）
+  rk3399-smart-am40-gpu.dtb   原版 + 仅 GPU 节点改动（不加 MPP）
+
+--------------------------------------------------------------------------------
+三、刷到哪里？两条互斥的路线
+--------------------------------------------------------------------------------
+路线 A：SD 当系统盘，eMMC 当存储空间
+    就按现在这样用 SD 启动；在飞牛 UI 里把 eMMC 格式化成存储空间。
+    因为本镜像已自带启动链，eMMC 怎么格式化都不影响开机。
+
+路线 B：eMMC 当系统盘（不需要 maskrom）
+    sudo dd if=<本镜像> of=/dev/mmcblk0 bs=4M conv=fsync status=progress
+    ⚠ 刷完请【把 SD 拔掉或清掉】：两份镜像的文件系统 UUID 与 GPT PARTUUID
+      完全相同，同时插着会撞车（root=PARTUUID=... 可能挂到另一块盘上）。
+    ⚠ eMMC 上原来的旧飞牛会被覆盖。
+    首次启动 resize-rootfs 会自动把 rootfs 扩到 eMMC 的 99%（约 29GB）。
+
+--------------------------------------------------------------------------------
+四、怎么看启动日志
+--------------------------------------------------------------------------------
+A) 接 HDMI 显示器（console=tty1 + verbosity=7；镜像里 root 是锁定的，
+   会停在登录提示符，但看日志不需要登录）。
+B) 诊断 initramfs（不用显示器，写到本分区）：编辑 fnEnv.txt 加一行
+   initrdfile=am40-diag.cpio.gz -> 开机等约 30 秒自动关机 -> 插电脑看
+   BOOT 分区根目录的 AM40-DIAG.txt。取完证把那行删掉。
+   连文件都没生成 => 内核根本没跑起来。
+
+--------------------------------------------------------------------------------
+五、其它
+--------------------------------------------------------------------------------
+  串口：ttyS2 / 1500000 / 8N1。首次启动 rootfs 自动扩容。
+  镜像名与本文件同分区；刷卡时注意本机 WSL 根盘是 /dev/sdd。
+
+================================================================================
+2026-09-16 21:00 复查（系统已自动更新到 1.2.0604）
+================================================================================
+* 现在跑 1.2.0604，内核 6.18.18.c1090-trim，仍然从 SD 卡自启动。
+* SD 启动链(0x8000~0x1000000) md5 53e488ce68d573274c35730385bd2d01 —— 完好。
+* MPP 在新内核上正常：mpp-srv probe success，VDPU2/VEPU2 就绪；
+  /dev/mpp_service 权限 660 root:video；ffmpeg h264_rkmpp 编解码实测通过。
+* eMMC 现在是存储空间(/vol1)，启动区已被清空、p1 从 1MB 开始，
+  所以 eMMC 不能再当启动盘；SD 必须能自启动，别再把它的链清掉。
+* 更新后自检一条命令：  sudo am40-check
+* 详细说明（更新会动 /boot 里的 dtb、卡启 vs eMMC 实测速度对比、搬家做法）
+  见本分区 AM40-刷机说明.md 的 §1.10。
+
+--------------------------------------------------------------------------------
+mediasrv 崩溃根因（2026-09-16 实测定位）
+--------------------------------------------------------------------------------
+现象：journalctl -u mediasrv 每 5 秒一轮
+      Started -> mpp[...]: mpp_platform: client 9 driver is not ready! -> status=11/SEGV
+根因：mediasrv 启动时向 MPP 要 HEVC 那一路，本 DTB 只让 MPP 绑定 H.264 两路
+      (mpp_vdpu2->ff650400.vdpu 解 / mpp_vepu2->ff650000.vepu 编)，
+      它不检查返回值 -> 空指针 -> SIGSEGV。ffmpeg 遇同样错误会优雅返回，是 mediasrv 自己的 bug。
+      RK3399 的 HEVC/VP9/4K 解码器 ff660000.video-codec 归 mainline V4L2 驱动(/dev/video0 "rkvdec")，
+      不是 MPP 客户端；且 RK3399 没有 HEVC 硬编。
+处理：sudo systemctl mask mediasrv          # 止血（Jellyfin 不受影响）
+      或 fdtfile 改回 rk3399-smart-am40.dtb  # 保 mediasrv，弃 MPP
+提示：HEVC 硬解可走 fnOS ffmpeg 的 hevc_v4l2m2m(/dev/video0)；H.264 用 h264_rkmpp。
+
+--------------------------------------------------------------------------------
+RK3399 编解码能力实测（2026-09-16 22:16，脚本 /usr/local/sbin/am40-codec-matrix）
+--------------------------------------------------------------------------------
+硬件可用（MPP，走 /dev/mpp_service）：
+  H.264 解 ✅ 2.72x | H.264 编 ✅ 1080p 1.22x / 4K 0.31x | MJPEG 解/编 ✅
+  MPEG-1/2/4 解 ✅ 2.7~2.9x | H.263 解 ✅ 11.9x | JPEG 解 ✅
+硬件不可用：
+  HEVC/VP8/VP9 解 ✗（MPP: client 9 driver is not ready!）
+  AV1 ✗（无硬件，用 libdav1d 软解 4.48x）
+  HEVC 编 ✗（RK3399 没有 HEVC 硬编）
+  V4L2(/dev/video0 rkvdec) ✗（ffmpeg v4l2m2m: Could not find a valid device）
+   注意：-hwaccel v4l2request 看着成功，其实回落到软解（CPU 时间与纯软解相同）
+  RGA 缩放 ✗（/dev/rga 不存在，scale_rkrga 滤镜失败）
+可用转码管线（H.264 目标）：
+  1080p H264(MPP解)→720p→H264(MPP编)  1.43x
+  1080p H265(软解)→720p→H264(MPP编)   1.54x  ← 主力用法
+  1080p VP9/AV1(软解)→720p→H264(硬编) 2.03x / 2.24x
+  4K H265(软解)→1080p→H264(硬编)      0.576x（不实时，瓶颈是软缩放）
+结论：这块板子的可行方案 = 软解 + H.264 硬编（1080p 实时没问题，4K 不实时）
+
+【更正 2026-09-16 22:45】主线 rkvdec 其实是能用的，之前写错了
+--------------------------------------------------------------------------------
+/dev/video0 = rkvdec (rockchip-vdec.ko, Boris Brezillon/Collabora, of:rockchip,rk3399-vdec)
+接口是 stateless / V4L2 Request API，实测 ioctl 枚举：
+  OUTPUT_MPLANE : S264="H.264 Parsed Slice Data"  VP9F="VP9 Frame"
+  CAPTURE_MPLANE: NV12   caps: VIDEO_M2M_MPLANE|EXT_PIX_FORMAT|STREAMING
+=> 所以 *_v4l2m2m（stateful 包装）报 "Could not find a valid device" 是正常的；
+   正确用法是 -hwaccel v4l2request，实测真硬件：
+     H.264 软解 utime 0.950s -> v4l2request 0.374s  ✅
+     VP9   软解 utime 1.503s -> v4l2request 0.309s  ✅
+     HEVC  v4l2request 2.020s ≈ 软解（驱动不暴露 HEVC）✗
+支持：H.264(8bit) + VP9(profile0/8bit) 解码，4K@60；不暴露 HEVC/10bit；只解不编
+hantro_vpu 这个内核没编 -> 主线给不了 H.264 硬编、也没有 MPEG/VC-1/VP8/H.263 解码
+混栈不行：v4l2request 的帧喂 h264_rkmpp 失败（hwmap rc=139 / hwdownload+hwupload rc=218）
+=> 转码仍是「软解 + MPP 硬编」或全 MPP(H.264)；VP9 硬解用于纯解码/缩略图场景
+
+【2026-09-16 22:40】官方 6.1 BSP 怎么绑 RK3399 的 VPU / 为什么我们不能全走 MPP
+--------------------------------------------------------------------------------
+官方 kernel-develop-6.1 BSP（= 和飞牛 MPP 同源的 nyanmisaka 树，源码在 kernel/kernel-develop-6.1.zip）
+的 rk3399.dtsi 里，四个 MPP 节点是：
+  mpp-srv            compatible = "rockchip,mpp-service"  taskqueue-count=2 resetgroup-count=2
+  vepu@ff650000      compatible = "rockchip,vpu-encoder-v2"  srv=&mpp_srv taskqueue=0 resetgroup=0
+  vdpu@ff650400      compatible = "rockchip,vpu-decoder-v2"  srv=&mpp_srv taskqueue=0 resetgroup=0
+  rkvdec@ff660000    compatible = "rockchip,rkv-decoder-rk3399"  srv=&mpp_srv taskqueue=1 resetgroup=1
+  （同时 mainline 的 vdec@ff660000="rockchip,rk3399-vdec" 和 vpu@ff650000="rockchip,rk3399-vpu" 都 status="disabled"）
+=> 我手搓的 mpp DTB 与官方完全一致，DTB 层面没问题。
+
+差别在编译开关：mpp_rkvdec.c 里 rk3399 那条匹配被 #ifdef CONFIG_CPU_RK3399 包着，
+飞牛的内核/模块没有开这个符号。
+
+关键：MPP 其实是可加载模块
+  /lib/modules/6.18.18.c1090-trim/updates/trim/rk_vcodec/rk_vcodec.ko
+  （所以 /boot/config-* 里没有任何 MPP 符号、kernel/drivers/.../mpp/ 是空的）
+  该 ko 里的 compatible 只有 rkv-decoder-rk3528/rk3562/rk3568/rk3576 + rkv-decoder-v1/v2/v2-ccu…
+  没有 rk3399 -> 编译时 CONFIG_CPU_RK3399 未开
+
+=> 想"全部走 MPP"：不必重编内核，只要用同一份 MPP 源码开 CONFIG_CPU_RK3399 重编
+   rk_vcodec.ko（板子上已有 gcc/make + 内核头文件 + Module.symvers），替换后配满编 DTB 即可。
+   回滚：把备份的 rk_vcodec.ko 拷回（模块坏了不影响开机）；MPP 解码卡死则断电 + fnEnv 换回旧 DTB。
+
+================================================================================
+2026-09-16 22:50 ★ 满编 MPP 已落地（RK3399 的 HEVC/VP9/4K 硬解全部走 MPP）
+================================================================================
+做法：fnOS 的 MPP 是一个可加载模块 rk_vcodec.ko（updates/trim/rk_vcodec/），
+      它的 compatible 列表里缺 rk3399（编译时 CONFIG_CPU_RK3399 没开）。
+      用 kernel-develop-6.1 的同源 MPP 源码重编了这个模块（板子上原生 gcc/make + 内核头文件）：
+        - 加 -DCONFIG_CPU_RK3399 以及 ROCKCHIP_MPP_{RKVDEC,VDPU2,VEPU2,JPGDEC,JPGENC,PROC_FS}
+        - 6.18 API 适配：class_create(name)、MODULE_IMPORT_NS("DMA_BUF")、fd_file(f)、
+          iommu_map(..., GFP_KERNEL)、去掉 asm/dma-iommu.h；补齐 vendor 头
+          (dma-buf-cache.h / rockchip_sip.h / rockchip_opp_select.h / uapi rk-mpp.h)
+      源码留在 ~/mppbuild（可重复编译）。
+DTB：rk3399-smart-am40-mpp-full.dtb（= mpp + 官方 6.1 BSP 风格的 rkvdec@ff660000 =
+      rockchip,rkv-decoder-rk3399 + taskqueue/resetgroup=1 + 6 条 reset + normal/advanced-rates 300MHz；
+      mainline 的 video-codec@ff660000 已 disable）。fnEnv.txt 的 fdtfile 指向它。
+结果（全 MPP，1080p 合成片）：H.264 解/编 OK、H.265 8bit 1.42x、H.265 10bit 1.37x、
+      H.265 4K 1.14x、VP9 1.26x、MPEG1/2/4、H.263、JPEG 全都 OK；
+      4K H.265 → 1080p → H.264 全 MPP 管线 OK(0.48x)；VP8/AV1 仍无硬件。
+      clock 从 50MHz 提到 400MHz（实测）。
+回滚：模块 cp /boot/rk_vcodec.ko.orig → /lib/modules/$(uname -r)/updates/trim/rk_vcodec/rk_vcodec.ko
+      + depmod -a + 重启；DTB 把 fnEnv.txt 的 fdtfile 换回 rk3399-smart-am40-mpp.dtb。
+已知遗留：
+  1) MPP 编码速度仍比 fnOS 原模块慢（1080p h264 ≈0.67x vs 1.22x，原因未完全定位，够实时用）。
+  2) mediasrv 崩溃的真正原因是 librga.so 缺 /dev/rga（不是 MPP）：fnOS 自带的 rga3.ko
+     modprobe 时报 "rga_iommu_bind, binding map scheduler failed!" → 加载失败。
+     mediasrv 保持 disable（enable --now 可恢复尝试）。
+
+================================================================================
+2026-09-16 23:05 ★ mediasrv 崩溃已修复（根因 = DTB 里 RGA 节点的 compatible）
+================================================================================
+现象：mediasrv 起来 3 秒就 status=11/SEGV，日志只到
+      "[info] cache dir ... invalid"，之前从来没打印过 "gpu in working"。
+      崩溃栈是 librga.so.2.1.0 里的 DABT level 0 translation fault。
+
+根因链（一句话：DTB 的 rga 节点没有任何驱动认领 -> 没 /dev/rga -> librga 一调就崩）：
+  1. DTB 里 rga@ff680000 compatible = "rockchip,rk3399-rga"（上游 mainline 的写法）；
+  2. fnOS 内核 CONFIG_VIDEO_ROCKCHIP_RGA is not set（没有 mainline 版 RGA 驱动）；
+  3. fnOS 只发 vendor 版 rga3.ko，strings 出来的 of_match 只有：
+     rockchip,rga2 / rockchip,rga2_core0 / rockchip,rga3 / rockchip,rga3_core0 / rockchip,rga3_core1
+     —— 没有 rk3399-rga，modinfo -F alias 也是空的（连 autoload alias 都没有）；
+  4. 模块 by name 能 insmod，但 rga2_driver/rga3_driver 谁都匹配不上这个节点
+     -> rga_drvdata->num_of_scheduler = 0
+     -> rga_drv.c 的 rga_iommu_bind() 里 main_iommu_index / main_mmu_index / another_index 全是 -1
+     -> pr_err("%s, binding map scheduler failed!") 然后 return -EFAULT
+     -> dmesg: rga_iommu: rga_iommu_bind, binding map scheduler failed!
+              rga: rga iommu bind failed!
+     -> modprobe: ERROR: could not insert 'rga3': Bad address
+  5. 没有 /dev/rga -> mediasrv 里 librga 空指针解引用 -> SEGV。
+
+为什么"官方也是这么写的"：
+  kernel-develop-6.1/arch/arm64/boot/dts/rockchip/rk3399-linux.dtsi 的 rga 节点就是
+      compatible = "rockchip,rga2";  clock-names = "aclk_rga","hclk_rga","clk_rga";
+  而且 arch/arm64/configs/rockchip_linux_defconfig 里 CONFIG_ROCKCHIP_MULTI_RGA=y（就是编出 rga3.ko 那个）。
+  4.4 的 rk3399-firefly-android.dts 同样写 "rockchip,rga2" 并带 dev_mode = <1>。
+  => 是 fnOS/AM40 这份 DTB 从 mainline 抄了 "rockchip,rk3399-rga"，跟它自己发的模块对不上。
+  （和 MPP 那个坑一模一样：DTB 与模块不是一套。）
+
+修法（只改 DTB 一个属性，板子上 dtc/fdtput 都有，不用重编内核、不用重刷）：
+  sudo cp /boot/dtb/rockchip/rk3399-smart-am40-mpp-full.dtb \
+          /boot/dtb/rockchip/rk3399-smart-am40-mpp-rga.dtb
+  sudo fdtput -t s /boot/dtb/rockchip/rk3399-smart-am40-mpp-rga.dtb /rga@ff680000 compatible "rockchip,rga2"
+  sudo sed -i 's#fdtfile=.*#fdtfile=rockchip/rk3399-smart-am40-mpp-rga.dtb#' /boot/fnEnv.txt
+  sudo reboot
+  # 重启后开机就自动加载 rga3，然后
+  sudo systemctl enable --now mediasrv
+
+修完的验证（dmesg）：
+  rga2 ff680000.rga: probe successfully, irq = 83, hw_version:3.2.18218
+  rga_iommu: IOMMU binding successfully, default mapping core[0x4]
+  rga: Module initialized. v1.3.4
+  # hw_version 3.2.18218 落到驱动兜底档 rga2e_data，mmu = RGA_MMU（RGA2 自带页表，不需要 iommus）
+
+mediasrv 日志新增（以前从来没有）：
+  [info] gpu in working, device_id 0, device '', vendor 'Rockchip', card_path ''
+  [info] gpu enable: true, selected sequence: 1
+  [info] webserver listen on '/var/run/mediasrv.socket'
+  systemctl status -> active (running)，NRestarts=0；/proc/<pid>/fd 里有 19 -> /dev/rga
+
+顺便验证 RGA 真能算：
+  rkrga 三个 ffmpeg 滤镜（scale_rkrga / vpp_rkrga / overlay_rkrga）以前一碰就崩，现在可用，
+  跑时报 "rga_api version 1.10.4_[1]"。
+  正确性：RGA 缩放 vs swscale 缩放，同帧逐像素 SSIM All:0.9961（Y 0.9987/U 0.9901/V 0.9918）。
+  全硬件转码：-hwaccel rkmpp -hwaccel_output_format drm_prime … -vf scale_rkrga … -c:v h264_rkmpp
+  1080p 约 0.49x，瓶颈是 H.264 编码器（0.67x）；带不带 RGA 缩放墙钟 19.8s vs 20.3s（10s 素材）。
+  注意 scale_rkrga 要 drm_prime 输入，纯软件输入会报 -38 ENOSYS（格式协商，不是 RGA 坏）。
+
+新增文件：
+  /boot/dtb/rockchip/rk3399-smart-am40-mpp-rga.dtb   md5 21d879e3618f6f49498d629139a6d0c3  ← 当前默认
+  /boot/rk3399-smart-am40-mpp-rga.dtb                同名副本（方便 Windows 下从 BOOT 分区取）
+  /boot/fnEnv.mpp-full.txt                           上一版 fnEnv.txt 备份
+回滚 RGA：fnEnv.txt 的 fdtfile 换回 rockchip/rk3399-smart-am40-mpp-full.dtb 后重启
+          （然后 mediasrv 会重新 SEGV，记得 systemctl disable mediasrv）。
+am40-check 已加 RGA 检查（rga3 加载 / rga2 绑定 / /dev/rga / 当前 fdtfile 是不是修正版），
+现在是 OK=21 FAIL=0。
+
+================================================================================
+2026-09-16 23:40 ★ AV1 视频也能播了（mediasrv 兼容垫片）
+================================================================================
+RGA 修好之后 mediasrv 能起来了，但播 AV1 还是报错。用 -l debug 抓到真实链路，
+发现是两个"RK3399 硬件能力"问题叠在一起，都不是飞牛的 bug：
+
+问题 1：RK3399 没有 AV1/VP8 硬解，mediasrv 却硬要开 av1_rkmpp
+  [debug] codec_id 225, Rockchip MPP (Media Process Platform) AV1 decoder
+  [debug] hw devices decoder=rkmpp, filter=rkmpp
+  [error] avcodec_open2 for video decoder error / errno -542398533 (AVERROR_EXTERNAL)
+  journalctl -u mediasrv 原话：
+    [av1_rkmpp] Failed to init MPP context: -1
+    mpp: unable to create dec av1 for soc rk3399 unsupported
+  => MPP 自己知道 rk3399 不支持 AV1，但 mediasrv 是用 av_codec_iterate() 遍历全部解码器、
+     按名字带 rkmpp 后缀来挑的，只看到"有个 av1_rkmpp"就以为能用。
+     注意：mediasrv 二进制里连 "av1_rkmpp" 字符串都没有（名字运行时拼的），
+     也不用 avcodec_find_decoder_by_name()，所以在 find_decoder* 里做手脚没用。
+
+问题 2：RK3399 没有 HEVC 硬编，前端却要 HEVC
+  [debug] codec_id 173, Rockchip MPP HEVC encoder
+  [hevc_rkmpp] Failed to init MPP context: -1
+  mpp: unable to create enc h265 for soc rk3399 unsupported
+  => RK3399 的 VEPU2 只能编 H.264(+MJPEG)。浏览器（Edge 装了 HEVC 扩展）告诉飞牛前端
+     "我能播 HEVC"，前端就发 "videoEncoder":"hevc"，mediasrv 拼出 hevc_rkmpp 去开 -> 必挂。
+     跟源是不是 AV1 无关：任何需要转码的片子在这个浏览器上都会撞到。
+
+解决：LD_PRELOAD 垫片 _work/rktools/mediasrv-shim.c（约 250 行，只用 libc+dl）
+  - av_codec_iterate() 里把 av1_rkmpp / vp8_rkmpp 藏起来 -> mediasrv 自己走 libdav1d / libvpx
+  - avcodec_find_encoder_by_name() 里把 *_rkmpp 且不是 h264_rkmpp/mjpeg_rkmpp 的
+    一律改写成 h264_rkmpp（hevc_rkmpp/av1_rkmpp/vp9_rkmpp…）
+  - avcodec_open2()/avcodec_find_decoder*() 只记日志到 /tmp/mediasrv-shim.log
+  不能在 avcodec_open2 里偷换解码器：ffmpeg 8 会拒绝
+  "This AVCodecContext was allocated for av1_rkmpp, but libdav1d passed to avcodec_open2()"，
+  必须在分配上下文之前就让它选对，所以只能从 av_codec_iterate 下手。
+
+安装（一条命令，脚本在 BOOT 分区也有一份，系统更新后重跑）：
+  sudo am40-fix-mediasrv            # 装/重装（优先现场 gcc 重编）+ 重启 mediasrv
+  sudo am40-fix-mediasrv --status   # 只看状态
+  sudo am40-fix-mediasrv --remove   # 摘掉，恢复原样
+文件：/usr/local/lib/mediasrv-shim.so、/etc/systemd/system/mediasrv.service.d/10-am40-shim.conf
+      /usr/local/sbin/am40-fix-mediasrv、/boot/{am40-mediasrv-shim.c,.so,10-am40-shim.conf,am40-fix-mediasrv.sh}
+
+实测（用户真实片源 /vol4/.../Hyouka 2012 S01E01-[1080p][BDRIP][AV1.OPUS].mkv，
+      AV1 Main 10bit 1920x1080 23.976fps + Opus + ASS + MJPEG 封面）：
+  请求 {"req":"media.getPlayLink",...,"videoEncoder":"hevc","subtitleIndex":2,1080p}
+    修复前 {"result":"fail","errno":68157450}
+    修复后 {"result":"succ","playLink":"/media/<hash>/preset.m3u8","hlsTime":4,...}
+  垫片日志链条：
+    find_encoder_by_name("hevc_rkmpp") -> 改用 "h264_rkmpp" -> h264_rkmpp
+    iterate: 隐藏 vp8_rkmpp / av1_rkmpp
+    find_decoder(id=225) -> libdav1d ; open2 OK codec=libdav1d
+    open2 OK codec=libfdk_aac / opus / ssa / webvtt ; open2 OK codec=h264_rkmpp
+  分片 ffprobe：h264 High 1920x1080 + aac，字幕已烧进去。
+  回归：H.265 1080p->720p 用 hevc_rkmpp 硬解 + h264_rkmpp 硬编 ✓
+        H.264 1080p->720p 用 h264_rkmpp 硬解 + h264_rkmpp 硬编 ✓
+
+⚠ 速度：AV1 转码只有 ~0.36x 实时。单测（6s 素材，ffmpeg -benchmark）：
+    只软解 AV1 10bit 1080p = 1.63x（不是瓶颈）
+    软解 + H.264 硬编      = 0.49x   ← 瓶颈是编码器（h264_rkmpp 只有 ~0.67x）
+    mediasrv 全链路(+烧ASS+AAC+HLS+机械盘) ≈ 0.36x
+  根因就是 MPP 那节留下的遗留项"编码比飞牛原模块慢一倍(0.67x vs 1.22x)"。
+  缓解：① 让飞牛先把整集转码缓存好再看；② 播放器里选 720p 档。
+  想真正解决只能回头啃 MPP H.264 编码性能。
+================================================================================
+
+================================================================================
+2026-09-17 00:15 ★★ 2 倍变慢真凶结案：每帧一次的内核 WARN（不需要超频）
+================================================================================
+结论先放这：
+  满编 MPP 模块（旧） vs 飞牛原版模块，跑在同一个 DTB、同一个 297MHz 下：
+      1080p H.264 编码  0.66x  vs  1.25x
+      1080p H.264 解码  1.37x  vs  3.33x
+  差一倍，不是时钟、不是容量、不是 userspace 库，而是我这份内核模块
+  每帧调用了一次 6.18 已废弃的 iommu_set_fault_handler()。
+
+1) 先排除时钟（走了一段弯路，记录下来免得再走）
+   /proc/mpp_service/vepu/aclk 可写（= mpp_clk_info.debug_rate_hz 覆盖），扫频：
+      297MHz -> 0.66x | 400MHz -> 0.76x | 594MHz -> 0.89x | 800MHz -> 1.23x | 1000MHz+ -> 0.03x
+   800MHz 能追平原版，但那是拿 2.7 倍功耗换回"本来就该有的速度"；
+   1GHz 反而把编码器打到 1fps。**不要超频**，厂商默认 300MHz 是对的。
+   （顺带确认：aclk_vcodec 空闲 50MHz/REDUCE、任务中 297MHz/NORMAL，驱动在管；
+     编码时 CPU 只占 40%，不是 CPU bound。解码速度对时钟完全不敏感 1.36~1.37x。）
+
+2) 真凶
+   drivers/video/rockchip/mpp/mpp_iommu.c: mpp_iommu_dev_activate()
+       iommu_set_fault_handler(info->domain, dev->fault_handler ?: mpp_iommu_handle, dev);
+   6.18 起 domain->ops->set_fault_handler == NULL -> WARN_ON + 整页调用栈
+   （含 1.5KB 的 "Modules linked in: ..."）。而"激活设备"是每帧一次：
+          编码 300 帧 -> dmesg 287 条 WARN；解码 300 帧 -> 同样 287 条。
+   fnEnv.txt 是 console=both，这些 WARN 同时刷串口(1.5Mbps)+HDMI 控制台，
+   一帧的打印开销比编码本身还大 -> 吞吐直接砍半。
+   不重编也能验证： sudo dmesg -n 1（只让 emergency 上控制台）
+          编码 600 帧 0.66x -> 1.17x ；解码 1.37x -> 9.2x
+
+3) 修法
+   _work/rktools/am40-patch-iommu.py（板上 /boot/am40-patch-iommu.py）把那段调用 #if 0，
+   并给 mpp_iommu_handle 加 __maybe_unused。6.18 的 rockchip-iommu 自己在中断里报
+   page fault，不需要驱动再注册。重编后版本号 custom-rk3399-full-v3。
+   （用户给的 mpp-develop 1.1.0 的 kmpp/ 里已经完全没有这套 fault handler，
+     方向一致；但那是新一代对象模型，跟板上 librockchip_mpp(a9380ef) 不是一套接口，
+     不能直接替换，所以只取"去掉这个调用"这一个结论。）
+
+4) 修后实测
+      1080p H.264 编码 600 帧（默认 295MHz）: 1.25x / 1.25x
+      1080p H.264 解码: 5.54x / 5.63x（控制台关掉时 9.2~9.7x）
+      AV1 10bit 软解 -> H.264 硬编（纯 ffmpeg）: 0.49x -> 1.49x
+      mediasrv 全链路(1080p AV1 10bit + 烧ASS + AAC + HLS): 0.36x -> 0.80x
+      同上选 720p 档: 1.07x（实时）
+      dmesg（300 帧编 + 一遍解）: 2588 行/287 WARN -> 0 行
+
+5) 文件
+   /boot/rk_vcodec.ko.rk3399-full-v3   当前（含修复，217,992 B）
+   /boot/rk_vcodec.ko.rk3399-full-v2   上一版（每帧 WARN，慢一倍）
+   /boot/rk_vcodec.ko.rk3399-full      v1
+   /boot/rk_vcodec.ko.orig             飞牛原版（只有 H.264）
+   /boot/am40-patch-iommu.py + /boot/am40-mpp_iommu-patched.c
+   源码树 ~/mppbuild（可重复编译）
+   am40-check 已加"Mpp 模块版本"和"dmesg 有无 iommu_set_fault_handler WARN"两项检查。
+
+================================================================================
+2026-09-17 ★ v6 镜像：只烘焙设备树 + 一个统一修复脚本
+================================================================================
+v6 交付物：
+  rom/fnos_1.2.0302_am40_SD-boot_v6.img   卡启（dd 到 SD）
+  rom/fnos_1.2.0302_am40_eMMC_v6.img      eMMC 直刷（dd 到 /dev/mmcblk0）
+  rom/am40-eMMC-flash_v6/                 瑞芯微工具包（update.img + MiniLoaderAll.bin）
+与 v5 的差别只有 BOOT 分区多了这些，rootfs 逐字节未改：
+  dtb/rockchip/rk3399-smart-am40-mpp-rga.dtb   新的默认设备树（满编 MPP + RGA 修正）
+  dtb/rockchip/rk3399-smart-am40-mpp-full.dtb  对照/回滚用
+  fnEnv.txt                                    fdtfile 指到 -mpp-rga（kernelfile 不变）
+  am40-apply-fixes                             统一修复脚本（唯一要执行的入口）
+  am40-fixes.tar.gz                            payload 283KB
+  am40-check.sh / AM40-NOTES.txt / AM40-刷机说明.md  更新
+
+刷完机一条命令：
+  sudo bash /boot/am40-apply-fixes        # 应用/补齐；幂等，可反复跑
+  sudo bash /boot/am40-apply-fixes --status   # 只看
+  sudo bash /boot/am40-apply-fixes --dry-run  # 只打印要做什么
+它做 5 件事（只有设备树需要重启生效）：
+  1 设备树：把 fnEnv 切到 -mpp-rga；必要时 fdtput 修 RGA compatible（只动我们自己的 DTB，
+    绝不改 stock 的 rk3399-smart-am40*.dtb —— 这一点在验收测试里踩过坑并修掉了）
+  2 MPP 模块：按 uname -r 装对应预编译 rk_vcodec.ko（c951 / c1090 各一份），
+    没有预编译版就用 payload 里的 mpp-src 现场编译；热重载并校验版本，失败自动回滚
+  3 mediasrv 垫片：现场编译（镜像里有 gcc）或预编译，装 drop-in，重启并确认真的加载了
+  4 服务与权限：enable mediasrv、/dev/mpp_service 权限、99-am40-mpp.rules
+  5 收尾：装 am40-check/am40-fix-mediasrv/am40-apply-fixes，同步文档，最后跑 am40-check
+原始文件备份在 /boot/am40-backup-<时间戳>/。
+
+验收测试（在现役板上做的，两种路径都过）：
+  a) --status 于已修好的系统 → OK=17 WARN=0 FAIL=0
+  b) 完整 apply 于已修好的系统（幂等）→ OK=19 FAIL=0，随后 am40-check OK=28 FAIL=0
+  c) 模拟全新镜像状态（模块换回飞牛原版、垫片删掉、mediasrv disable、
+     fnEnv 指回半编 MPP DTB）→ 脚本一把补齐，am40-check 恢复 OK=28 FAIL=0，
+     且 stock rk3399-smart-am40-mpp.dtb 的 md5 保持 1eecee28 未被误改
+
+内核版本说明：
+  镜像自带 6.18.18.c951-trim；跑一次飞牛系统更新会到 6.18.18.c1090-trim。
+  两份预编译模块都已放进 payload（c951 那份是照镜像里的官方头文件编的，vermagic 正确；
+  注意：c951 这份尚未在 c951 内核上实机跑过，靠"更新后再跑一次脚本"或现场重编兜底）。
+  镜像里自带 aarch64-linux-gnu-gcc-12 + make + /usr/src/linux-headers-<ver>（含 Module.symvers），
+  且 CONFIG_MODVERSIONS 未开 → 只要 vermagic 对就能加载，换内核也能现场重编。
+  代价：升级内核后系统更新会覆盖 /usr/lib/modules/<ver>/updates/trim/rk_vcodec/，
+  所以更新后要再跑一次 am40-apply-fixes（am40-check 会报出来）。

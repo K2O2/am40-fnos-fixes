@@ -1,0 +1,290 @@
+#!/bin/bash
+# ============================================================================
+#  am40-apply-fixes —— AM40 (RK3399) 飞牛整机修复统一入口
+#
+#  镜像里只烘焙了「修正过的设备树」，其余修复全部由这个脚本在机器上落地。
+#  设计原则：幂等（可反复跑）、自包含（附带 payload，不需要联网）、
+#            可回滚（关键步骤失败自动退回原状）。
+#
+#  用法：
+#     sudo bash /boot/am40-apply-fixes            # 应用/补齐全部修复
+#     sudo bash /boot/am40-apply-fixes --status    # 只看状态，不改任何东西
+#     sudo bash /boot/am40-apply-fixes --dry-run   # 打印将要做什么，不改
+#
+#  做了哪 5 件事：
+#     1. 设备树：确保 fnEnv.txt 指向 rk3399-smart-am40-mpp-rga.dtb（满编 MPP + RGA 修正）
+#     2. MPP 模块：装上带「每帧 WARN」修复的 rk_vcodec.ko（预编译优先，其次现场重编）
+#     3. mediasrv 垫片：AV1 走软件解码、做不到的 HEVC 硬编回退成 H.264
+#     4. 服务与权限：enable mediasrv、/dev/mpp_service 权限
+#     5. 自检：跑 am40-check 报结果
+#
+#  需要重启才生效的只有「设备树」（其余都能热生效）。
+#  系统更新（换内核/覆盖模块）之后再跑一次即可。
+# ============================================================================
+set -u
+
+SELF="$(readlink -f "$0")"
+BOOTDIR="$(dirname "$SELF")"
+PAYLOAD="$BOOTDIR/am40-fixes.tar.gz"
+WORK=/run/am40-fixes
+KVER="$(uname -r)"
+KO_DST="/lib/modules/$KVER/updates/trim/rk_vcodec/rk_vcodec.ko"
+HDR_DIR="/usr/src/linux-headers-$KVER"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BK_DIR="/boot/am40-backup-$STAMP"
+SHIM_SO=/usr/local/lib/mediasrv-shim.so
+SHIM_DROPIN=/etc/systemd/system/mediasrv.service.d/10-am40-shim.conf
+MPP_DTB=rk3399-smart-am40-mpp-rga.dtb
+MPP_DTB_PATH="/boot/dtb/rockchip/$MPP_DTB"
+MPP_DTB_MD5=21d879e3618f6f49498d629139a6d0c3
+MPPV_EXPECT=custom-rk3399-full-v3
+
+MODE=apply; DRY=0
+case "${1:---apply}" in
+  --status)  MODE=status;;
+  --dry-run) MODE=apply; DRY=1;;
+  --apply|"") MODE=apply;;
+  -h|--help) sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0;;
+  *) echo "用法: sudo bash $0 [--status|--dry-run]"; exit 1;;
+esac
+MUT=0; [ "$MODE" = apply ] && [ "$DRY" = 0 ] && MUT=1
+
+ok=0; bad=0; warn=0; needreboot=0
+OK()   { printf '  [ OK ] %s\n' "$*"; ok=$((ok+1)); }
+BAD()  { printf '  [FAIL] %s\n' "$*"; bad=$((bad+1)); }
+WARN() { printf '  [WARN] %s\n' "$*"; warn=$((warn+1)); }
+STEP() { printf '\n== %s\n' "$*"; }
+DO()   { if [ "$MUT" = 1 ]; then "$@"; else printf '    (未执行) %s\n' "$*"; fi; }
+
+[ "$(id -u)" = 0 ] || { echo "需要 root：sudo bash $0"; exit 1; }
+
+# ---------------------------------------------------------------- 0. 预检
+STEP "0. 预检"
+[ "$(uname -m)" = aarch64 ] && OK "架构 aarch64" || { BAD "不是 aarch64，停"; exit 1; }
+if grep -q "rk3399" /proc/device-tree/compatible 2>/dev/null; then
+  OK "SoC rk3399（$(tr '\0' ' ' < /proc/device-tree/compatible)）"
+else
+  WARN "device-tree 里没读到 rk3399，继续但请留意"
+fi
+if [ -d /boot/dtb/rockchip ]; then
+  OK "/boot 已挂载（$(findmnt -no SOURCE /boot 2>/dev/null)）"
+else
+  BAD "/boot 没挂载（先 sudo mount /boot）；停"; exit 1
+fi
+if [ -f "$PAYLOAD" ]; then
+  OK "payload: $PAYLOAD ($(stat -c%s "$PAYLOAD") B)"
+else
+  BAD "找不到 $PAYLOAD（应和本脚本放同一目录）"; exit 1
+fi
+if [ "$MUT" = 1 ] && [ ! -w /boot ]; then BAD "/boot 不可写"; exit 1; fi
+
+rm -rf "$WORK" 2>/dev/null
+mkdir -p "$WORK" 2>/dev/null || { WORK=/tmp/am40-fixes; rm -rf "$WORK"; mkdir -p "$WORK"; }
+if tar xzf "$PAYLOAD" -C "$WORK" && [ -d "$WORK/am40-fixes" ]; then
+  P="$WORK/am40-fixes"
+  OK "payload 解包成功，版本：$(cat "$P/VERSION" 2>/dev/null || echo '?')"
+else
+  BAD "payload 解包失败"; exit 1
+fi
+
+# ---------------------------------------------------------------- 1. 设备树
+STEP "1. 设备树（满编 MPP + RGA 修正）"
+FDT="$(sed -n 's/^fdtfile=//p' /boot/fnEnv.txt 2>/dev/null | tail -1)"
+echo "     当前 fdtfile=${FDT:-（无）}"
+
+# (a) 确保「我们自己那个」DTB 在位、内容正确 —— 只动这个文件，绝不动 stock DTB
+if [ ! -f "$MPP_DTB_PATH" ] && [ -f "$P/dtb/$MPP_DTB" ] && [ "$MUT" = 1 ]; then
+  cp -f "$P/dtb/$MPP_DTB" "$MPP_DTB_PATH" && OK "已安装 $MPP_DTB"
+fi
+if [ -f "$MPP_DTB_PATH" ]; then
+  m=$(md5sum "$MPP_DTB_PATH" | cut -d' ' -f1)
+  if [ "$m" = "$MPP_DTB_MD5" ]; then
+    OK "$MPP_DTB md5 与发布版一致"
+  else
+    # 用 dtc 自行编译的 DTB 布局会与发布版（fdtput 就地改出来的）不同，
+    # 这不代表有问题 —— 功能性判断看下面那条 RGA 节点检查。
+    echo "  [note] $MPP_DTB md5=$m（与发布版不同；自编 DTB 属正常）"
+  fi
+  c="$(fdtget -t s "$MPP_DTB_PATH" /rga@ff680000 compatible 2>/dev/null || true)"
+  case "$c" in
+    *rga2*) OK "$MPP_DTB 的 RGA 节点 = $c" ;;
+    "")     WARN "$MPP_DTB 里读不到 RGA 节点" ;;
+    *)      WARN "$MPP_DTB 的 RGA 节点 = $c（应为 rockchip,rga2）"
+            if [ "$MUT" = 1 ]; then
+              fdtput -t s "$MPP_DTB_PATH" /rga@ff680000 compatible "rockchip,rga2" 2>/dev/null \
+                && { OK "已修正 $MPP_DTB 的 RGA compatible"; needreboot=1; }
+            fi ;;
+  esac
+else
+  BAD "$MPP_DTB_PATH 不存在"
+fi
+
+# (b) fnEnv 指向
+if [ "$FDT" = "rockchip/$MPP_DTB" ]; then
+  OK "fnEnv 已指向修正 DTB"
+else
+  WARN "fnEnv 指向 ${FDT:-（空）}，不是修正 DTB"
+  if [ "$MUT" = 1 ]; then
+    cp -a /boot/fnEnv.txt "/boot/fnEnv.txt.bak-$STAMP"
+    if grep -q '^fdtfile=' /boot/fnEnv.txt; then
+      sed -i "s#^fdtfile=.*#fdtfile=rockchip/$MPP_DTB#" /boot/fnEnv.txt
+    else
+      echo "fdtfile=rockchip/$MPP_DTB" >> /boot/fnEnv.txt
+    fi
+    OK "fnEnv.txt 已切到 rockchip/$MPP_DTB（备份 fnEnv.txt.bak-$STAMP）"
+    needreboot=1
+  fi
+fi
+
+# (c) 当前「运行中」的设备树（判断 /dev/rga 是否已经对了）—— 只读
+LIVE="$(tr '\0' ' ' < /proc/device-tree/rga@ff680000/compatible 2>/dev/null || true)"
+case "$LIVE" in
+  *rga2*) OK "运行中的设备树 RGA 节点 = ${LIVE% } → /dev/rga 正常" ;;
+  "")     WARN "运行中的设备树里读不到 rga 节点" ;;
+  *)      WARN "运行中的设备树 RGA 节点 = ${LIVE% }（未修正）→ 重启后才好" ; needreboot=1 ;;
+esac
+if [ -c /dev/rga ]; then
+  OK "/dev/rga 存在"
+else
+  WARN "/dev/rga 不存在（多半是 DTB 还没生效，重启后再看）"
+  needreboot=1
+fi
+
+# ---------------------------------------------------------------- 2. MPP 模块
+STEP "2. MPP 内核模块（满编 rk3399 + 每帧 WARN 修复）"
+CURV="$(cat /proc/mpp_service/version 2>/dev/null || echo '(未加载)')"
+echo "     内核 $KVER，当前已加载 MPP 版本：$CURV"
+NWARN=$(dmesg 2>/dev/null | grep -c iommu_set_fault_handler || true)
+if [ "$MODE" = status ]; then
+  [ "$CURV" = "$MPPV_EXPECT" ] && OK "已加载 $MPPV_EXPECT" || BAD "已加载 [$CURV]，应为 $MPPV_EXPECT"
+  [ -f "$KO_DST" ] && OK "磁盘模块存在 ($(stat -c%s "$KO_DST") B)" || BAD "$KO_DST 不存在"
+  [ "${NWARN:-0}" -gt 20 ] && BAD "dmesg 有 $NWARN 条每帧 WARN（旧模块，编解码慢一倍）" || OK "dmesg 无每帧 WARN"
+else
+  NEW=""
+  PRE="$P/rk_vcodec-$KVER.ko"
+  if [ -f "$PRE" ]; then
+    NEW="$PRE"; OK "用预编译模块 rk_vcodec-$KVER.ko ($(stat -c%s "$PRE") B)"
+  elif [ -d "$P/mpp-src" ] && [ -d "$HDR_DIR" ] && command -v make >/dev/null 2>&1; then
+    WARN "没有 $KVER 的预编译模块 → 现场编译"
+    if [ "$MUT" = 1 ]; then
+      if ( cd "$P/mpp-src" && make -C "$HDR_DIR" M="$P/mpp-src" modules \
+             KCFLAGS="-Wno-error=incompatible-pointer-types" ) >/tmp/am40-mpp-build.log 2>&1; then
+        NEW="$P/mpp-src/rk_vcodec.ko"; OK "现场编译成功（/tmp/am40-mpp-build.log）"
+      else
+        BAD "现场编译失败，见 /tmp/am40-mpp-build.log"
+      fi
+    fi
+  else
+    BAD "既无 $KVER 的预编译模块，也无法现场编译（缺 $HDR_DIR 或 make）"
+  fi
+
+  if [ -n "$NEW" ] && [ "$MUT" = 1 ]; then
+    mkdir -p "$BK_DIR"
+    [ -f "$KO_DST" ] && cp -a "$KO_DST" "$BK_DIR/rk_vcodec.ko.bak" && OK "原模块已备份 → $BK_DIR/"
+    cp -f "$NEW" "$KO_DST" && chmod 644 "$KO_DST"
+    depmod -a 2>/dev/null || true
+    systemctl stop mediasrv 2>/dev/null
+    for pid in $(pgrep -x ffmpeg 2>/dev/null); do kill "$pid" 2>/dev/null; done
+    sleep 1
+    if rmmod rk_vcodec 2>/dev/null; then
+      if insmod "$KO_DST" 2>/dev/null && [ "$(cat /proc/mpp_service/version 2>/dev/null)" = "$MPPV_EXPECT" ]; then
+        OK "新模块已热加载并生效（$MPPV_EXPECT）"
+      else
+        BAD "新模块加载异常 → 回滚"
+        rmmod rk_vcodec 2>/dev/null
+        if [ -f "$BK_DIR/rk_vcodec.ko.bak" ]; then
+          cp -f "$BK_DIR/rk_vcodec.ko.bak" "$KO_DST"; insmod "$KO_DST" 2>/dev/null && WARN "已回滚到原模块"
+        fi
+      fi
+    else
+      WARN "模块被占用，无法热重载 —— 文件已装好，重启后自动生效"
+      needreboot=1
+    fi
+    systemctl start mediasrv 2>/dev/null
+  fi
+fi
+
+# ---------------------------------------------------------------- 3. mediasrv 垫片
+STEP "3. mediasrv 兼容垫片（AV1 软解 / HEVC 编码回退）"
+_smod=0
+if [ -f "$SHIM_SO" ]; then OK "垫片已在 /usr/local/lib"; _smod=1; else WARN "垫片未安装"; fi
+if [ -f "$SHIM_DROPIN" ]; then OK "drop-in 已装"; else WARN "drop-in 未装"; fi
+if [ "$MODE" = status ]; then
+  _p=$(pgrep -x mediasrv | head -1)
+  if [ -n "$_p" ] && tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q mediasrv-shim; then
+    OK "mediasrv 已加载垫片"
+  else
+    BAD "mediasrv 未加载垫片"
+  fi
+elif [ "$MUT" = 1 ]; then
+  mkdir -p /usr/local/lib /etc/systemd/system/mediasrv.service.d
+  if gcc -shared -fPIC -O2 -o "$SHIM_SO" "$P/mediasrv-shim.c" -ldl -lpthread 2>/tmp/am40-shim-build.log; then
+    OK "垫片现场编译成功"
+  else
+    cp -f "$P/mediasrv-shim.so" "$SHIM_SO" && OK "垫片用预编译版（编译日志 /tmp/am40-shim-build.log）"
+  fi
+  chmod 644 "$SHIM_SO"
+  cp -f "$P/10-am40-shim.conf" "$SHIM_DROPIN"
+  systemctl daemon-reload
+  systemctl enable mediasrv >/dev/null 2>&1
+  systemctl restart mediasrv
+  sleep 5
+  _p=$(pgrep -x mediasrv | head -1)
+  if [ -n "$_p" ] && tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q mediasrv-shim; then
+    OK "mediasrv 已带垫片运行（pid $_p）"
+  else
+    BAD "mediasrv 没带垫片起来 → 回滚 drop-in"
+    rm -f "$SHIM_DROPIN"; systemctl daemon-reload; systemctl restart mediasrv 2>/dev/null
+  fi
+fi
+
+# ---------------------------------------------------------------- 4. 服务与权限
+STEP "4. 服务与设备权限"
+if systemctl is-enabled mediasrv >/dev/null 2>&1; then
+  OK "mediasrv 已 enable"
+else
+  if [ "$MUT" = 1 ]; then systemctl enable mediasrv >/dev/null 2>&1 && OK "mediasrv 已 enable"; else WARN "mediasrv 未 enable"; fi
+fi
+if [ -c /dev/mpp_service ]; then
+  perm=$(stat -c '%a %U:%G' /dev/mpp_service)
+  if [ "$perm" = "660 root:video" ]; then OK "/dev/mpp_service $perm"
+  elif [ "$MUT" = 1 ]; then chmod 660 /dev/mpp_service; chown root:video /dev/mpp_service; OK "/dev/mpp_service 权限已修正"
+  else WARN "/dev/mpp_service 权限 $perm"; fi
+else
+  BAD "/dev/mpp_service 不存在（模块没起来？）"
+fi
+if [ "$MUT" = 1 ] && [ -f "$P/99-am40-mpp.rules" ]; then
+  if ! cmp -s "$P/99-am40-mpp.rules" /etc/udev/rules.d/99-am40-mpp.rules 2>/dev/null; then
+    cp -f "$P/99-am40-mpp.rules" /etc/udev/rules.d/99-am40-mpp.rules && OK "已更新 99-am40-mpp.rules（重启后自动设权限）"
+  fi
+fi
+
+# ---------------------------------------------------------------- 5. 工具与文档
+STEP "5. 工具与文档"
+if [ "$MUT" = 1 ]; then
+  for f in am40-check.sh am40-fix-mediasrv.sh am40-codec-matrix.sh; do
+    [ -f "$P/bin/$f" ] && install -m 755 "$P/bin/$f" "/usr/local/sbin/${f%.sh}"
+  done
+  cp -f "$SELF" /usr/local/sbin/am40-apply-fixes 2>/dev/null && chmod 755 /usr/local/sbin/am40-apply-fixes
+  [ -f "$P/doc/AM40-NOTES.txt" ]     && cp -f "$P/doc/AM40-NOTES.txt" /boot/AM40-NOTES.txt
+  [ -f "$P/doc/AM40-刷机说明.md" ]     && cp -f "$P/doc/AM40-刷机说明.md" "/boot/AM40-刷机说明.md"
+  OK "am40-check / am40-fix-mediasrv / am40-apply-fixes / 文档 已同步"
+fi
+
+# ---------------------------------------------------------------- 汇总
+STEP "结果"
+echo "  OK=$ok  WARN=$warn  FAIL=$bad"
+if [ "$MUT" = 1 ] && [ -x /usr/local/sbin/am40-check ]; then
+  echo
+  /usr/local/sbin/am40-check 2>&1 | tail -20
+fi
+if [ "$needreboot" = 1 ]; then
+  echo
+  echo "  >>> 设备树/模块有需要重启才生效的项：sudo reboot  （或重启后再跑一次本脚本确认）"
+fi
+if [ "$bad" -gt 0 ]; then
+  echo "  有失败项，请核对上面的 [FAIL] 行。"
+  [ "$MUT" = 1 ] && [ -d "$BK_DIR" ] && echo "  本次改动的原始文件备份在：$BK_DIR/"
+  exit 1
+fi
+exit 0

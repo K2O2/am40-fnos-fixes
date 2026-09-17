@@ -1,0 +1,115 @@
+#!/bin/bash
+# ============================================================================
+# am40-fix-mediasrv —— 给飞牛 mediasrv 装/重装 AM40(RK3399) 专用垫片
+#
+# 解决三个问题（都跟 RK3399 硬件能力有关，不是飞牛的 bug）：
+#   1) RK3399 没有 AV1 / VP8 硬解，mediasrv 却会去开 av1_rkmpp/vp8_rkmpp
+#      -> avcodec_open2 失败 -> 播放/缩略图报 errno 4096。垫片把它们隐藏，
+#         让 mediasrv 用软件解码器（libdav1d / libvpx）。
+#   2) RK3399 的 VEPU2 只能编 H.264，没有 HEVC 编码器；浏览器支持 HEVC 时前端
+#      会要求 videoEncoder=hevc -> hevc_rkmpp 打开失败。垫片把"做不到的 rkmpp
+#      硬编"统一改成 h264_rkmpp（播放器拿到的就是 H.264 分片，浏览器都认）。
+#   3) 顺便把所有解码器查找/打开记到 /tmp/mediasrv-shim.log，方便排查。
+#
+# 用法： sudo am40-fix-mediasrv          # 装/重装 + 重启 mediasrv
+#        sudo am40-fix-mediasrv --status # 只看状态，不改
+#        sudo am40-fix-mediasrv --remove # 卸载垫片，恢复原样
+#
+# 系统更新后建议重跑一次（更新可能覆盖 /etc/systemd/system 下的 drop-in）。
+# ============================================================================
+set -u
+
+SO_SRC_BOOT=/boot/am40-mediasrv-shim.so
+C_SRC_BOOT=/boot/am40-mediasrv-shim.c
+DROPIN_SRC_BOOT=/boot/10-am40-shim.conf
+SO_DST=/usr/local/lib/mediasrv-shim.so
+DROPIN=/etc/systemd/system/mediasrv.service.d/10-am40-shim.conf
+SOCK=/var/run/mediasrv.socket
+OK() { printf '  [ OK ] %s\n' "$*"; }
+BAD() { printf '  [FAIL] %s\n' "$*"; }
+WARN() { printf '  [WARN] %s\n' "$*"; }
+
+status() {
+	echo "--- mediasrv 垫片状态 ---"
+	if [ -f "$SO_DST" ]; then
+		OK "$SO_DST 存在 ($(stat -c%s "$SO_DST") B, md5 $(md5sum "$SO_DST" | cut -c1-8))"
+	else
+		BAD "$SO_DST 不存在"
+	fi
+	if [ -f "$DROPIN" ]; then
+		OK "drop-in 存在：$DROPIN"
+		grep -q LD_PRELOAD "$DROPIN" && OK "drop-in 里有 LD_PRELOAD" || BAD "drop-in 里没有 LD_PRELOAD"
+	else
+		BAD "drop-in 不存在：$DROPIN"
+	fi
+	P=$(pgrep -x mediasrv | head -1)
+	if [ -n "$P" ]; then
+		tr '\0' '\n' < "/proc/$P/environ" | grep -q mediasrv-shim \
+			&& OK "mediasrv(pid $P) 已加载垫片" || BAD "mediasrv(pid $P) 没加载垫片"
+	else
+		BAD "mediasrv 没在跑"
+	fi
+	systemctl is-active mediasrv >/dev/null 2>&1 && OK "mediasrv active" || BAD "mediasrv 不是 active"
+	[ "$(systemctl show mediasrv -p NRestarts --value)" = 0 ] \
+		&& OK "重启次数 0" || WARN "重启次数 $(systemctl show mediasrv -p NRestarts --value)"
+	[ -c /dev/rga ] && OK "/dev/rga 存在" || BAD "/dev/rga 不存在（RGA 的 DTB 修正没生效，mediasrv 会崩）"
+	[ -c /dev/mpp_service ] && OK "/dev/mpp_service 存在" || BAD "/dev/mpp_service 不存在（MPP 没起来）"
+	[ -f /tmp/mediasrv-shim.log ] && echo "  最近垫片日志：$(wc -l < /tmp/mediasrv-shim.log) 行（/tmp/mediasrv-shim.log）"
+}
+
+remove() {
+	echo "--- 卸载垫片 ---"
+	systemctl stop mediasrv 2>/dev/null
+	rm -f "$DROPIN" "$SO_DST"
+	rmdir /etc/systemd/system/mediasrv.service.d 2>/dev/null
+	systemctl daemon-reload
+	systemctl start mediasrv 2>/dev/null
+	OK "垫片已移除，mediasrv 用回原样（AV1/HEVC 编码会重新报错，这是 RK3399 的硬件限制）"
+}
+
+install_shim() {
+	echo "--- 安装垫片 ---"
+	mkdir -p /usr/local/lib /etc/systemd/system/mediasrv.service.d
+
+	# 优先用板子上的 gcc 就地重编（这样和当前 ffmpeg/内核完全匹配），编不出来就用备份的 .so
+	if [ -f "$C_SRC_BOOT" ] && command -v gcc >/dev/null 2>&1; then
+		if gcc -shared -fPIC -O2 -o "$SO_DST" "$C_SRC_BOOT" -ldl -lpthread 2>/tmp/am40-shim-build.log; then
+			OK "用 gcc 现场编译成功 -> $SO_DST"
+		elif [ -f "$SO_SRC_BOOT" ]; then
+			WARN "现场编译失败（见 /tmp/am40-shim-build.log），改用 /boot 里的预编译版"
+			install -m 644 "$SO_SRC_BOOT" "$SO_DST"
+		else
+			BAD "现场编译失败，也没有预编译版可用"; return 1
+		fi
+	elif [ -f "$SO_SRC_BOOT" ]; then
+		install -m 644 "$SO_SRC_BOOT" "$SO_DST"
+		OK "已安装预编译垫片 -> $SO_DST"
+	else
+		BAD "既没有 $C_SRC_BOOT 也没有 $SO_SRC_BOOT，无法安装"; return 1
+	fi
+	chmod 644 "$SO_DST"
+
+	if [ -f "$DROPIN_SRC_BOOT" ]; then
+		install -m 644 "$DROPIN_SRC_BOOT" "$DROPIN"
+	else
+		cat > "$DROPIN" <<'EOF'
+[Service]
+Environment=LD_PRELOAD=/usr/local/lib/mediasrv-shim.so
+ExecStart=
+ExecStart=/usr/trim/bin/mediasrv -o /usr/trim/logs/mediasrv.log -a /var/run/mediasrv.socket -l debug
+EOF
+	fi
+	OK "drop-in 已写入 $DROPIN"
+
+	systemctl daemon-reload
+	systemctl restart mediasrv
+	sleep 5
+	systemctl is-active mediasrv >/dev/null 2>&1 && OK "mediasrv 已重启" || BAD "mediasrv 起不来，看 journalctl -u mediasrv"
+}
+
+case "${1:---install}" in
+	--status) status;;
+	--remove) remove;;
+	--install|"") install_shim; echo; status;;
+	*) echo "用法: sudo am40-fix-mediasrv [--status|--remove]"; exit 1;;
+esac

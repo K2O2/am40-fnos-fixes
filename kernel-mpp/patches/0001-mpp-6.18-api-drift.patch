@@ -1,0 +1,84 @@
+========================================================================
+0001 — 把 Rockchip vendor MPP 内核驱动迁到 6.18
+========================================================================
+改动点（详见 kernel-mpp/README.md）：
+  mpp_service.c : class_create(THIS_MODULE, ...) -> class_create(...)
+                  MODULE_IMPORT_NS(DMA_BUF)      -> MODULE_IMPORT_NS("DMA_BUF")
+  mpp_common.c  : f.file / f.file->x            -> fd_file(f) / fd_file(f)->x
+  mpp_rkvdec.c  : iommu_map(...) 补 GFP_KERNEL 参数
+  mpp_iommu.c   : 删掉 arm64 上已不存在的 <asm/dma-iommu.h>（其代码本就被
+                  #ifdef CONFIG_ARM_DMA_USE_IOMMU 排除）
+
+应用： cd kernel-mpp && git apply -p1 --directory=mpp patches/0001-*.patch
+      （或在 mpp/ 里 patch -p2）
+========================================================================
+
+diff --git a/mpp/mpp_service.c b/mpp/mpp_service.c
+--- a/mpp/mpp_service.c
++++ b/mpp/mpp_service.c
+@@ -413,7 +413,7 @@
+ 	atomic_set(&srv->shutdown_request, 0);
+ 	platform_set_drvdata(pdev, srv);
+ 
+-	srv->cls = class_create(THIS_MODULE, MPP_CLASS_NAME);
++	srv->cls = class_create(MPP_CLASS_NAME);
+ 	if (PTR_ERR_OR_ZERO(srv->cls))
+ 		return PTR_ERR(srv->cls);
+ 
+@@ -543,7 +543,7 @@
+ 
+ module_platform_driver(mpp_service_driver);
+ 
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ MODULE_LICENSE("Dual MIT/GPL");
+ MODULE_VERSION(MPP_VERSION);
+ MODULE_AUTHOR("Ding Wei leo.ding@rock-chips.com");
+diff --git a/mpp/mpp_common.c b/mpp/mpp_common.c
+--- a/mpp/mpp_common.c
++++ b/mpp/mpp_common.c
+@@ -1555,7 +1555,7 @@
+ 			goto session_switch_done;
+ 
+ 		f = fdget(bat_msg.fd);
+-		if (!f.file) {
++		if (!fd_file(f)) {
+ 			int ret = -EBADF;
+ 
+ 			mpp_err("fd %d get session failed\n", bat_msg.fd);
+@@ -1576,10 +1576,10 @@
+ 		}
+ 
+ 		/* switch session */
+-		session = f.file->private_data;
++		session = fd_file(f)->private_data;
+ 		msgs = get_task_msgs(session);
+ 
+-		if (f.file->private_data == session)
++		if (fd_file(f)->private_data == session)
+ 			msgs->ext_fd = bat_msg.fd;
+ 
+ 		msgs->f = f;
+diff --git a/mpp/mpp_rkvdec.c b/mpp/mpp_rkvdec.c
+--- a/mpp/mpp_rkvdec.c
++++ b/mpp/mpp_rkvdec.c
+@@ -1214,7 +1214,7 @@
+ 		page_iova = round_down(iova, IOMMU_PAGE_SIZE);
+ 		ret = iommu_map(mpp->iommu_info->domain, page_iova,
+ 				page_to_phys(dec->aux_page), IOMMU_PAGE_SIZE,
+-				IOMMU_READ | IOMMU_WRITE);
++				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+ 		if (!ret)
+ 			dec->aux_iova = page_iova;
+ 	}
+diff --git a/mpp/mpp_iommu.c b/mpp/mpp_iommu.c
+--- a/mpp/mpp_iommu.c
++++ b/mpp/mpp_iommu.c
+@@ -20,7 +20,6 @@
+ #include <linux/platform_device.h>
+ 
+ #ifdef CONFIG_ARM_DMA_USE_IOMMU
+-#include <asm/dma-iommu.h>
+ #endif
+ #include <soc/rockchip/rockchip_iommu.h>
+ 

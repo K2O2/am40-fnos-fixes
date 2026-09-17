@@ -1,0 +1,5 @@
+# AM40: Rockchip MPP / RGA / Mali 设备权限（Jellyfin 等非 root 进程需要）
+KERNEL=="mpp_service", MODE="0660", GROUP="video"
+KERNEL=="rga",         MODE="0660", GROUP="video"
+KERNEL=="mali0",       MODE="0660", GROUP="video"
+SUBSYSTEM=="drm", KERNEL=="renderD*", MODE="0660", GROUP="video"
