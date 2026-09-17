@@ -93,7 +93,6 @@ sudo bash kernel-mpp/build.sh         # 只重编内核模块
 ├── docs/
 │   ├── TECHNICAL-REPORT.md       ★ 分层技术报告（DTB / 内核模块 / 用户态 / 服务 / 运维 + 证据速查）
 │   ├── USAGE.md                  刷机与应用、逐层校验方法、回滚清单
-│   ├── DELIVERY-NOTES.md         镜像交付说明与实测历史（操作性文档）
 │   └── BOOT-NOTES.txt            会随镜像放进 BOOT 分区的简要说明
 ├── scripts/
 │   ├── am40-apply-fixes          统一修复入口（幂等 + 自动回滚）
