@@ -1,5 +1,7 @@
 # AM40 (RK3399) 飞牛 fnOS 硬件编解码 / 2D 加速修复
 
+警告⚠️：0701版本已经确认无法直接编译迁移，如果想维持VPU驱动，建议不要升级0701。该项目已经提交论坛，等待官方适配中
+
 让 **SMART-AM40（RK3399）** 上跑飞牛 fnOS 时，硬件编解码（MPP）和 2D 加速（RGA）真正可用的一组补丁与脚本。
 
 > **English TL;DR** — Fixes for Rockchip MPP (video codec) and RGA (2D) on the SMART-AM40 / RK3399
